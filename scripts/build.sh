@@ -14,6 +14,12 @@ fi
 
 cp "$ROOT/chainproxy_qt.py"   "$RES/chainproxy_qt.py"
 cp "$ROOT/chainproxy_core.py" "$RES/chainproxy_core.py"
+# core/ is the platform-dispatching backend package — chainproxy_core.py is
+# only a `from core import *` shim, so the package itself must ship in the
+# bundle. Without this the launcher dies with ModuleNotFoundError: 'core'.
+rm -rf "$RES/core"
+cp -R "$ROOT/core" "$RES/core"
+find "$RES/core" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
 chmod +x "$APP/Contents/MacOS/ChainProxy"
 
 # Strip any stale quarantine flag (otherwise Gatekeeper nags on first launch).
