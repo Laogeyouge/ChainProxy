@@ -1,0 +1,115 @@
+{
+  "_README": "示例配置：把它复制到 ~/Library/Application Support/ChainProxy/config.json，再用 GUI 配置自己的节点。所有 \"FILL_ME_IN\" 字段必须改成你自己的真实值。",
+
+  "local_port": 7890,
+  "controller_port": 9999,
+  "controller_secret": "chainproxy",
+  "set_system_proxy_on_start": true,
+  "tun_mode": false,
+  "active_first_hop": "FastLink",
+  "active_second_hop": "我的二跳",
+
+  "first_hops": [
+    {
+      "name": "FastLink",
+      "type": "socks5",
+      "server": "127.0.0.1",
+      "port": 6666,
+      "username": "",
+      "password": "",
+      "udp": true,
+      "tls": false,
+      "skip_cert_verify": false,
+      "_comment": "示例：第一跳通常是机场客户端在本机暴露的 SOCKS5 端口（端口号按你的机场客户端为准）。"
+    }
+  ],
+
+  "second_hops": [
+    {
+      "name": "我的二跳",
+      "type": "socks5",
+      "server": "FILL_ME_IN.example.com",
+      "port": 443,
+      "username": "FILL_ME_IN",
+      "password": "FILL_ME_IN",
+      "udp": true,
+      "tls": false,
+      "skip_cert_verify": false,
+      "_comment": "示例：第二跳是链路终点节点。把 server/port/username/password 改成你自己的。也可以用 trojan / ss / vmess / hysteria2，参考 GUI 节点编辑面板。"
+    }
+  ],
+
+  "first_hop_process_names": [
+    "FastLink机场",
+    "AtlasCore_arm64",
+    "AtlasCore_amd64"
+  ],
+
+  "rule_sets": [
+    {"name": "reject", "behavior": "domain", "target": "REJECT",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt",
+     "enabled": true, "desc": "广告 / 隐私 / 恶意域名"},
+    {"name": "private", "behavior": "domain", "target": "DIRECT",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt",
+     "enabled": true, "desc": "内网 / 局域网域名"},
+    {"name": "applications", "behavior": "classical", "target": "DIRECT",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt",
+     "enabled": true, "desc": "国内常见应用程序"},
+    {"name": "direct", "behavior": "domain", "target": "DIRECT",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt",
+     "enabled": true, "desc": "国内常用网站（直连）"},
+    {"name": "icloud", "behavior": "domain", "target": "DIRECT",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/icloud.txt",
+     "enabled": true, "desc": "iCloud 域名"},
+    {"name": "apple", "behavior": "domain", "target": "DIRECT",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/apple.txt",
+     "enabled": true, "desc": "Apple 服务"},
+    {"name": "google", "behavior": "domain", "target": "FastLinkOnly",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/google.txt",
+     "enabled": true, "desc": "Google 服务（走第一跳）"},
+    {"name": "proxy", "behavior": "domain", "target": "FastLinkOnly",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt",
+     "enabled": true, "desc": "常见需代理的境外域名"},
+    {"name": "gfw", "behavior": "domain", "target": "FastLinkOnly",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt",
+     "enabled": true, "desc": "GFW 黑名单域名"},
+    {"name": "tld-not-cn", "behavior": "domain", "target": "FastLinkOnly",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/tld-not-cn.txt",
+     "enabled": true, "desc": "非 .cn 顶级域名"},
+    {"name": "telegramcidr", "behavior": "ipcidr", "target": "FastLinkOnly",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/telegramcidr.txt",
+     "enabled": true, "desc": "Telegram IP 段"},
+    {"name": "lancidr", "behavior": "ipcidr", "target": "DIRECT",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt",
+     "enabled": true, "desc": "局域网 IP 段"},
+    {"name": "cncidr", "behavior": "ipcidr", "target": "DIRECT",
+     "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt",
+     "enabled": true, "desc": "中国大陆 IP 段"}
+  ],
+
+  "rule_sets_last_update": "",
+
+  "custom_rules_pre": [
+    "DOMAIN-SUFFIX,openai.com,Chain",
+    "DOMAIN-SUFFIX,oaistatic.com,Chain",
+    "DOMAIN-SUFFIX,oaiusercontent.com,Chain",
+    "DOMAIN-SUFFIX,chatgpt.com,Chain",
+    "DOMAIN-SUFFIX,auth0.com,Chain",
+    "DOMAIN-KEYWORD,openai,Chain",
+    "DOMAIN-SUFFIX,anthropic.com,Chain",
+    "DOMAIN-KEYWORD,claude,Chain",
+    "DOMAIN,gemini.google.com,Chain",
+    "DOMAIN,generativelanguage.googleapis.com,Chain",
+    "DOMAIN,aistudio.google.com,Chain",
+    "DOMAIN,ai.google.dev,Chain",
+    "DOMAIN-SUFFIX,meta.ai,Chain",
+    "DOMAIN,graph.meta.ai,Chain",
+    "DOMAIN-SUFFIX,llama.meta.com,Chain"
+  ],
+
+  "custom_rules_post": [],
+
+  "final_target": "FastLinkOnly",
+  "rules_enabled": true,
+  "theme": "auto"
+}

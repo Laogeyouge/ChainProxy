@@ -1,0 +1,29 @@
+# Build / dist
+dist/
+*.dmg
+
+# The app bundle has source stamped in by scripts/build.sh — don't commit those copies.
+ChainProxy.app/Contents/Resources/chainproxy_qt.py
+ChainProxy.app/Contents/Resources/chainproxy_core.py
+
+# macOS / Python cruft
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Editor state
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local-only runtime
+runtime/
+*.log
+
+# User's real config — never commit. Use config.example.json as the template.
+config.json
+my-config.json

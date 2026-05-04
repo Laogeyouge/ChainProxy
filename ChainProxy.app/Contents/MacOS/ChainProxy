@@ -1,0 +1,33 @@
+#!/bin/bash
+# ChainProxy launcher (Qt edition).
+# Self-contained: code lives in ../Resources/ inside the bundle.
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd)"
+RES="$(cd "$HERE/../Resources" && pwd)"
+LOGDIR="$HOME/Library/Application Support/ChainProxy/runtime"
+mkdir -p "$LOGDIR"
+
+# Prefer python3 from PATH, fall back to common Homebrew locations so a
+# double-click from Finder (which has a minimal PATH) still finds python3.
+PY=""
+for cand in \
+    "$(command -v python3 2>/dev/null)" \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3 \
+    /usr/bin/python3 ; do
+  if [ -x "$cand" ]; then PY="$cand"; break; fi
+done
+
+if [ -z "$PY" ]; then
+  /usr/bin/osascript -e 'display alert "ChainProxy" message "未找到 python3。请先安装 Python 3：brew install python"'
+  exit 1
+fi
+
+# Fail early with a clear message if PyQt6 isn't installed.
+if ! "$PY" -c "import PyQt6" >/dev/null 2>&1; then
+  /usr/bin/osascript -e 'display alert "ChainProxy" message "缺少 PyQt6。请运行：pip3 install PyQt6"'
+  exit 1
+fi
+
+cd "$RES"
+exec "$PY" "$RES/chainproxy_qt.py" >> "$LOGDIR/app.log" 2>&1
