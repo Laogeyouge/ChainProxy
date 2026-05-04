@@ -10,20 +10,29 @@ ChainProxy 是 macOS 上的链式代理 GUI（本机 → 第一跳 → 第二跳
 
 ```
 ChainProxy/
-├── chainproxy_qt.py            ← GUI 全部代码（PyQt6 单文件，约 1900 行）
-├── chainproxy_core.py          ← 后端：mihomo runner / 配置 / 系统代理 / TUN 助手
-├── config.example.json         ← 示例配置（节点占位符 + 真实自定义规则）
-├── icon.png                    ← README 头图（GitHub 不渲染 .icns，所以 PNG 另存）
-├── ChainProxy.app/             ← .app 骨架（committed，不含 .py，build.sh 拷进去）
-├── scripts/{build.sh,make_dmg.sh,make_icon.py}
+├── chainproxy_qt.py            ← GUI 全部代码（PyQt6 单文件）
+├── chainproxy_core.py          ← thin shim：from core import *
+├── core/                       ← 平台分发后端
+│   ├── __init__.py             ← 按 sys.platform import _macos / _windows
+│   ├── _common.py              ← 跨平台：YAML 生成、规则集下载、URL 测试、配置 schema
+│   ├── _macos.py               ← macOS：networksetup、osascript、sudoers helper、fcntl
+│   └── _windows.py             ← Windows：注册表、UAC ShellExecute、Mutex、taskkill
+├── config.example.json         ← 示例配置
+├── icon.png                    ← README 头图
+├── icon.ico                    ← Windows .exe 图标（多分辨率 16-256）
+├── ChainProxy.app/             ← .app 骨架（macOS 用）
+├── scripts/
+│   ├── build.sh / make_dmg.sh / make_icon.py        ← macOS 打包
+│   ├── build_windows.ps1                            ← Windows 打包驱动
+│   ├── chainproxy_windows.spec                      ← PyInstaller spec
+│   └── make_icon_windows.py                         ← icon.ico 生成
+├── tests/{smoke_test.py,test_yaml_parity.py}        ← headless 测试
 ├── dist/                       ← 构建产物（gitignored）
-├── docs/                       ← 项目历史、Windows 移植计划、handoff 笔记
-├── CLAUDE.md                   ← 这个文件
-├── README.md                   ← 用户文档（中文）
-└── LICENSE                     ← MIT
+├── docs/                       ← 项目历史、handoff 笔记
+└── README.md / LICENSE / CLAUDE.md
 ```
 
-**单一来源原则**：顶层 `chainproxy_qt.py` / `chainproxy_core.py` 是源码。`ChainProxy.app/Contents/Resources/` 里**不**提交 `.py`（`.gitignore` 里排除了），由 `scripts/build.sh` 在打包时拷进去。
+**单一来源原则**：顶层 `chainproxy_qt.py` / `chainproxy_core.py` / `core/` 是源码。`ChainProxy.app/Contents/Resources/` 里**不**提交 `.py`（`.gitignore` 里排除了），由 `scripts/build.sh` 在打包时拷进去。Windows 用 PyInstaller 直接从仓库根打包。
 
 ## 常用命令
 
@@ -47,11 +56,17 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
 
 ## 配置文件位置（运行时）
 
+**macOS：**
 - 配置：`~/Library/Application Support/ChainProxy/config.json`
-- 运行时：`~/Library/Application Support/ChainProxy/runtime/`（mihomo.yaml, mihomo.log, app.log, ruleset/）
+- 运行时：`~/Library/Application Support/ChainProxy/runtime/`（mihomo.yaml, mihomo.log, ruleset/）
 - TUN 模式装的 sudoers 助手：`/usr/local/bin/chainproxy-helper.sh` + `/etc/sudoers.d/chainproxy`
 
-**Windows 上路径不一样**：见 `docs/WINDOWS_PORT_PLAN.md`。
+**Windows：**
+- 配置：`%APPDATA%\ChainProxy\config.json`（即 `C:\Users\<U>\AppData\Roaming\ChainProxy\`）
+- 运行时：`%APPDATA%\ChainProxy\runtime\`
+- mihomo.exe 推荐放：`%APPDATA%\ChainProxy\mihomo.exe`，也支持 PATH / Program Files / scoop / chocolatey
+- 系统代理：HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings 注册表
+- TUN：每次启动 mihomo 都触发 UAC（Windows 没有 macOS 那种"装一次免密"机制）
 
 ## 关键设计决定
 
@@ -72,11 +87,18 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
 - 不要弹"我做了 X"的总结，用户自己看 diff
 - 节点信息绝对不能进 git（仓库已脱敏，`.gitignore` 里有 `config.json`）
 
-## 当前状态（2026-05-04）
+## 当前状态（2026-05-05）
 
-- ✅ macOS 版完整可用，1.0.1 已发布
-- ✅ /Applications/ChainProxy.app 在跑，运行时 config 已自动迁移到 1.0.1（`FastLinkOnly` → `FirstHopOnly`）
-- 🔜 用户在考虑做 Windows 版。计划见 `docs/WINDOWS_PORT_PLAN.md`
+- ✅ macOS 版 1.0.1 已发布
+- ✅ Windows 版完成端到端移植 + 真机验证：
+  - core 拆成平台分发（`core/_common.py` + `core/_macos.py` + `core/_windows.py`）
+  - 系统代理：HKCU 注册表 snapshot/restore，启动失败时自动恢复用户原代理
+  - TUN：GUI 启动时一次 UAC（`relaunch_elevated`），整个会话启停 mihomo 不再弹
+  - mihomo 启动后 poll controller 端口 2 秒确认存活，避免代理被设到死端口
+  - 规则集监控：mihomo controller `/logs` API 实时拉日志（解决 elevated mihomo stdout 不可重定向）
+  - PyInstaller spec + Inno Setup `installer.iss`：installer 自带 mihomo.exe，用户可选安装路径 + 桌面快捷方式
+  - 测试：smoke / yaml parity / proxy lifecycle / live runner 四套全过
+- 🚀 下版本（1.1.0）：把 Windows installer 加进 Releases；release 流程见 `docs/RELEASE.md`
 
 ## 给 Claude 的工作约定
 

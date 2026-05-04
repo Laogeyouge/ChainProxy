@@ -11,6 +11,7 @@ Apple System-Settings-grade design:
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -19,14 +20,16 @@ from typing import Callable, Optional
 
 from PyQt6.QtCore import (QEasingCurve, QPoint, QPropertyAnimation, QRect,
                           QSize, Qt, QTimer, pyqtSignal)
-from PyQt6.QtGui import (QAction, QColor, QFont, QFontMetrics, QKeySequence,
-                          QPainter, QPainterPath, QPalette, QPen, QShortcut)
+from PyQt6.QtGui import (QAction, QColor, QFont, QFontMetrics, QIcon,
+                          QKeySequence, QPainter, QPainterPath, QPalette,
+                          QPen, QShortcut)
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QStackedWidget, QStyle, QStyledItemDelegate, QTableWidget,
-    QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QSizePolicy, QStackedWidget, QStyle, QStyledItemDelegate, QSystemTrayIcon,
+    QTableWidget, QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 import chainproxy_core as core
@@ -56,8 +59,11 @@ LIGHT = {
     "warn":        "#ff9500",
     "warn_soft":   "rgba(255,149,0,0.14)",
     "input_bg":    "#ffffff",
-    "log_bg":      "#0f1115",
-    "log_fg":      "#dde0e5",
+    # Light-mode log: white card, dim text — matches the rest of the
+    # surface. Older versions used a black "terminal" background here, but
+    # that broke the consistency of light mode.
+    "log_bg":      "#fafafc",
+    "log_fg":      "#3a3a3f",
     "shadow":      "rgba(0,0,0,0.04)",
     "hover":       "rgba(0,0,0,0.04)",
     "press":       "rgba(0,0,0,0.07)",
@@ -95,7 +101,7 @@ DARK = {
 
 def stylesheet(c: dict) -> str:
     return f"""
-* {{ font-family: ".AppleSystemUIFont", "Helvetica Neue"; }}
+* {{ font-family: ".AppleSystemUIFont", "Helvetica Neue", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; }}
 
 QMainWindow, QDialog {{ background: {c['window']}; }}
 QWidget#root, QWidget#page {{ background: {c['window']}; color: {c['text']}; }}
@@ -112,7 +118,7 @@ QLabel.rowLabel     {{ font-size: 13px; font-weight: 500; color: {c['text']}; }}
 QLabel.rowSub       {{ font-size: 12px; color: {c['text_dim']}; }}
 QLabel.dim          {{ font-size: 12px; color: {c['text_dim']}; }}
 QLabel.mute         {{ font-size: 12px; color: {c['text_mute']}; }}
-QLabel.mono         {{ font-family: "Menlo"; font-size: 12px; color: {c['text']}; }}
+QLabel.mono         {{ font-family: "Menlo", "Consolas", "Cascadia Mono", monospace; font-size: 12px; color: {c['text']}; }}
 QLabel.statHero     {{ font-size: 24px; font-weight: 700; }}
 QLabel.statValue    {{ font-size: 16px; font-weight: 600; }}
 QLabel.statLabel    {{ font-size: 11px; font-weight: 600;
@@ -268,7 +274,7 @@ QLineEdit, QComboBox, QPlainTextEdit, QTextEdit {{
 QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus, QTextEdit:focus {{
     border-color: {c['accent']};
 }}
-QPlainTextEdit, QTextEdit {{ font-family: "Menlo"; font-size: 12.5px; }}
+QPlainTextEdit, QTextEdit {{ font-family: "Menlo", "Consolas", "Cascadia Mono", monospace; font-size: 12.5px; }}
 QComboBox::drop-down {{
     subcontrol-origin: padding; subcontrol-position: top right;
     width: 22px; border: none;
@@ -342,7 +348,7 @@ QScrollArea > QWidget > QWidget {{ background: {c['window']}; }}
 QPlainTextEdit#log {{
     background: {c['log_bg']}; color: {c['log_fg']};
     border: 1px solid {c['border']}; border-radius: 10px;
-    font-family: "Menlo"; font-size: 12px;
+    font-family: "Menlo", "Consolas", "Cascadia Mono", monospace; font-size: 12px;
     padding: 10px 12px;
 }}
 QTextEdit#result {{
@@ -361,8 +367,27 @@ def detect_dark_mode(app) -> bool:
     try:
         return app.styleHints().colorScheme() == Qt.ColorScheme.Dark
     except Exception:
-        bg = app.palette().color(QPalette.ColorRole.Window)
-        return bg.lightness() < 128
+        pass
+    # Fallback for Windows 10 (where Qt's colorScheme() may not detect AppsUseLightTheme):
+    # read the registry directly. Cheap and robust.
+    if sys.platform == "win32":
+        try:
+            import winreg
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as k:
+                v, _ = winreg.QueryValueEx(k, "AppsUseLightTheme")
+                return int(v) == 0
+        except OSError:
+            pass
+    bg = app.palette().color(QPalette.ColorRole.Window)
+    return bg.lightness() < 128
+
+
+# ─── Cosmetic key labels by platform ─────────────────────────────────────
+# Display modifier shows in tooltips / footer hints. Qt's QKeySequence
+# already maps Ctrl→Cmd internally on macOS, so the bindings work as-is on
+# both platforms — only the label changes.
+MOD_LABEL = "⌘" if sys.platform == "darwin" else "Ctrl"
 
 
 # ─── Tiny widget helpers ───────────────────────────────────────────────────
@@ -549,7 +574,7 @@ class ChainView(QWidget):
     """Visual representation of 本机 → 第一跳 → 第二跳 → 目标."""
     def __init__(self):
         super().__init__()
-        self.local = ChainNode("本机", "macOS")
+        self.local = ChainNode("本机", core.PLATFORM_LABEL)
         self.first = ChainNode("—", "第一跳")
         self.second = ChainNode("—", "第二跳")
         self.target = ChainNode("目标", "互联网")
@@ -623,8 +648,11 @@ class OverviewPage(QWidget):
         self.chain = ChainView()
 
         self.action_btn = B("启动", "success", self._toggle)
+        recover_tip = ("清系统代理 / 杀残留 mihomo / 删 TUN 路由"
+                       if sys.platform == "darwin"
+                       else "清系统代理 / 杀残留 mihomo.exe")
         self.recover_btn = B("网络急救", "ghost", app.panic_recover,
-                              tooltip="清系统代理 / 杀残留 mihomo / 删 TUN 路由")
+                              tooltip=recover_tip)
         actions = vbox(self.action_btn, self.recover_btn,
                        spacing=8)
         actions.setAlignment(Qt.AlignmentFlag.AlignTop |
@@ -664,7 +692,7 @@ class OverviewPage(QWidget):
         self.quick_result.setWordWrap(True)
         quick_card = card(
             hbox(L("快速测试", "cardTitle"), "stretch",
-                 L("⌘T 聚焦", "mute")),
+                 L(f"{MOD_LABEL}T 聚焦", "mute")),
             hbox(self.quick_url, self.quick_btn, spacing=8),
             self.quick_result,
             spacing=12,
@@ -774,8 +802,14 @@ class OverviewPage(QWidget):
         self.quick_result.setStyleSheet(
             f"color: {self.app.colors['text_dim']};")
 
+        cfg = self.app.cfg
+        ctl_port = int(cfg.get("controller_port", 9999))
+        ctl_secret = cfg.get("controller_secret", "")
+
         def worker():
-            res = core.test_url_through_proxy(url, port, core.MIHOMO_LOG)
+            res = core.test_url_through_proxy(
+                url, port, core.MIHOMO_LOG,
+                controller_port=ctl_port, controller_secret=ctl_secret)
             def render():
                 col = self.app.colors
                 if res.get("ok"):
@@ -1289,7 +1323,10 @@ class RulesPage(QWidget):
         name_item = QTableWidgetItem(rs["name"])
         name_item.setFlags(Qt.ItemFlag.ItemIsEnabled |
                            Qt.ItemFlag.ItemIsSelectable)
-        name_item.setFont(QFont("Menlo", 11))
+        mono_font = QFont()
+        mono_font.setFamilies(["Menlo", "Consolas", "Cascadia Mono"])
+        mono_font.setPointSize(11)
+        name_item.setFont(mono_font)
         self.tbl.setItem(i, 1, name_item)
 
         # Column 2: target combo (inline editable)
@@ -1428,8 +1465,14 @@ class TestPage(QWidget):
         self.result.setHtml(
             f"<span style='color:{c['text_dim']}'>测试中…</span>")
 
+        cfg = self.app.cfg
+        ctl_port = int(cfg.get("controller_port", 9999))
+        ctl_secret = cfg.get("controller_secret", "")
+
         def worker():
-            res = core.test_url_through_proxy(url, port, core.MIHOMO_LOG)
+            res = core.test_url_through_proxy(
+                url, port, core.MIHOMO_LOG,
+                controller_port=ctl_port, controller_secret=ctl_secret)
             self.app.qt_invoke(lambda: self._render(res))
             self.app.qt_invoke(lambda: self._add_history(res))
         threading.Thread(target=worker, daemon=True).start()
@@ -1440,7 +1483,7 @@ class TestPage(QWidget):
         rows.append(
             f"<div style='color:{c['text_dim']};font-size:11px;"
             f"text-transform:uppercase;letter-spacing:0.5px'>URL</div>"
-            f"<div style='font-family:Menlo;font-size:12.5px;margin-bottom:10px'>"
+            f"<div style='font-family:Menlo,Consolas,monospace;font-size:12.5px;margin-bottom:10px'>"
             f"{res.get('url','?')}</div>")
         if res.get("ok"):
             ttls = res.get('time_tls_ms', 0)
@@ -1482,7 +1525,7 @@ class TestPage(QWidget):
             for ln in res["log_lines"][-3:]:
                 rows.append(
                     f"<pre style='color:{c['text_dim']};margin:2px 0;"
-                    f"font-family:Menlo;font-size:11.5px'>{ln}</pre>")
+                    f"font-family:Menlo,Consolas,monospace;font-size:11.5px'>{ln}</pre>")
         self.result.setHtml("".join(rows))
 
     def _add_history(self, res):
@@ -1574,15 +1617,22 @@ class SettingsPage(QWidget):
             spacing=10,
         )
 
+        tun_sub = ("接管系统所有 IPv4 流量。第一次启用会要求管理员密码。"
+                   if sys.platform == "darwin"
+                   else "接管系统所有 IPv4 流量。每次启动都需通过 UAC 授权。")
+        tun_extra = ("• 开启后无需配置 SOCKS5 / 系统代理\n"
+                     "• 你的机场客户端自身的 TUN 必须关闭\n"
+                     "• 异常断网时回到「概览」点「网络急救」"
+                     if sys.platform == "darwin"
+                     else "• 开启后无需配置 SOCKS5 / 系统代理\n"
+                          "• 你的机场客户端自身的 TUN 必须关闭\n"
+                          "• 每次启动 mihomo 时会弹 UAC 提权（Windows 限制）\n"
+                          "• 异常断网时回到「概览」点「网络急救」")
         tun_card = card(
             L("高级", "cardTitle"),
             divider(soft=True),
-            settings_row(
-                "TUN 模式", self.tun_chk,
-                "接管系统所有 IPv4 流量。第一次启用会要求管理员密码。"),
-            L("• 开启后无需配置 SOCKS5 / 系统代理\n"
-              "• 你的机场客户端自身的 TUN 必须关闭\n"
-              "• 异常断网时回到「概览」点「网络急救」", "rowSub"),
+            settings_row("TUN 模式", self.tun_chk, tun_sub),
+            L(tun_extra, "rowSub"),
             spacing=10,
         )
 
@@ -1593,9 +1643,11 @@ class SettingsPage(QWidget):
             spacing=10,
         )
 
+        reveal_label = ("在 Finder 中显示" if sys.platform == "darwin"
+                        else "在文件管理器中显示")
         cfg_actions = hbox(
             B("在编辑器中打开", "ghost", self._open_config),
-            B("在 Finder 中显示", "ghost", self._reveal_config),
+            B(reveal_label, "ghost", self._reveal_config),
             "stretch",
             spacing=8,
         )
@@ -1650,11 +1702,18 @@ class SettingsPage(QWidget):
         core.save_config(self.app.cfg)
         self.app.toast("已自动保存")
         if on:
-            QMessageBox.information(self, "TUN 模式",
-                "已启用 TUN 模式。\n\n"
-                "• 第一次启动时需输入管理员密码（之后免密）\n"
-                "• 异常断网时点「网络急救」恢复\n"
-                "• 你的机场客户端自身的 TUN 必须关闭")
+            if sys.platform == "darwin":
+                msg = ("已启用 TUN 模式。\n\n"
+                       "• 第一次启动时需输入管理员密码（之后免密）\n"
+                       "• 异常断网时点「网络急救」恢复\n"
+                       "• 你的机场客户端自身的 TUN 必须关闭")
+            else:
+                msg = ("已启用 TUN 模式。\n\n"
+                       "• 每次启动 mihomo 都会弹 UAC 授权（Windows 限制）\n"
+                       "• 异常断网时点「网络急救」恢复\n"
+                       "• 你的机场客户端自身的 TUN 必须关闭\n"
+                       "• 务必在「first_hop_process_names」里填上机场客户端进程名")
+            QMessageBox.information(self, "TUN 模式", msg)
         self.app.on_config_change()
         if self.app.runner.is_running():
             self.app.maybe_restart_for_config_change(silent=True)
@@ -1667,10 +1726,24 @@ class SettingsPage(QWidget):
         self.app.refresh_theme()
 
     def _open_config(self):
-        subprocess.Popen(["open", "-t", str(core.CONFIG_PATH)])
+        path = str(core.CONFIG_PATH)
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-t", path])
+        elif sys.platform == "win32":
+            # os.startfile launches the default editor (Notepad / VSCode etc.)
+            os.startfile(path)
+        else:
+            subprocess.Popen(["xdg-open", path])
 
     def _reveal_config(self):
-        subprocess.Popen(["open", "-R", str(core.CONFIG_PATH)])
+        path = str(core.CONFIG_PATH)
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        elif sys.platform == "win32":
+            # /select, highlights the file in Explorer instead of opening it.
+            subprocess.Popen(["explorer", f"/select,{path}"])
+        else:
+            subprocess.Popen(["xdg-open", str(core.CONFIG_PATH.parent)])
 
 
 # ─── Main window ───────────────────────────────────────────────────────────
@@ -1698,6 +1771,13 @@ class MainWindow(QMainWindow):
         self._build()
         self.refresh_theme()
         self.runner.attach_existing(self.log)
+        # Startup cleanup: if a previous GUI session was killed (task manager,
+        # crash, OS restart) while system proxy was enabled, the registry now
+        # points at a dead port and the user has no internet. We detect this
+        # by checking for the proxy_backup file we leave during enable. If
+        # present AND no orphan mihomo was adopted, restore the snapshot now.
+        if sys.platform == "win32" and not self.runner.is_running():
+            self._cleanup_orphan_proxy_state()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -1716,6 +1796,7 @@ class MainWindow(QMainWindow):
             pass
 
         self._install_shortcuts()
+        self._build_tray()
 
     def _build(self):
         root = QWidget()
@@ -1770,7 +1851,7 @@ class MainWindow(QMainWindow):
         sb_lay.addStretch(1)
 
         # Footer hint
-        version = QLabel("v1.0  ·  ⌘1–5 切换页面")
+        version = QLabel(f"v1.1  ·  {MOD_LABEL}1–5 切换页面")
         version.setStyleSheet(
             f"color: {self.colors['text_mute']}; font-size: 11px;"
             f"padding: 0 16px;")
@@ -1942,8 +2023,22 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, title, msg)
 
+        # Re-probe each click — user may have just installed mihomo without
+        # restarting the GUI.
         if not self.mihomo_bin:
-            fail("未找到 mihomo", "请运行 brew install mihomo", critical=True)
+            self.mihomo_bin = core.find_mihomo()
+        if not self.mihomo_bin:
+            if sys.platform == "darwin":
+                hint = "请运行 brew install mihomo"
+            elif sys.platform == "win32":
+                hint = ("请把 mihomo.exe 放到下列任一位置：\n\n"
+                        f"  • {core.SUPPORT_DIR}\\mihomo.exe（推荐）\n"
+                        "  • C:\\Program Files\\mihomo\\mihomo.exe\n"
+                        "  • 任何 PATH 中的目录\n\n"
+                        "下载：https://github.com/MetaCubeX/mihomo/releases")
+            else:
+                hint = "请安装 mihomo"
+            fail("未找到 mihomo", hint, critical=True)
             return
         fh = next((x for x in self.cfg["first_hops"]
                    if x["name"] == self.cfg["active_first_hop"]), None)
@@ -1955,23 +2050,94 @@ class MainWindow(QMainWindow):
                  f"无法连接 {fh['server']}:{fh['port']}（{fh['name']}）。\n\n"
                  "请先打开你的第一跳机场客户端，并关闭它的「系统代理」「TUN」开关。")
             return
+        # TUN-mode loop-prevention guard: if the first hop is on 127.0.0.1
+        # (i.e. it's another local proxy client whose own outbound traffic
+        # would be re-captured by our TUN), require the user to list that
+        # client's process names. Without this, every dial through the
+        # first hop deadlocks and TLS times out.
+        if (self.cfg.get("tun_mode")
+                and fh["server"] in ("127.0.0.1", "localhost", "::1")
+                and not (self.cfg.get("first_hop_process_names") or [])):
+            fail("TUN 模式配置不完整",
+                 "你启用了 TUN 模式，且第一跳指向本机 "
+                 f"({fh['server']}:{fh['port']})。\n\n"
+                 "TUN 会捕获**所有** IPv4 流量，包括你机场客户端自己的拨号 — "
+                 "这会让客户端连不上它的远程服务器，TLS 握手永远失败。\n\n"
+                 "解决方案任选其一：\n"
+                 "  ① 关闭 TUN 模式（设置页），改用「系统代理模式」（推荐）\n"
+                 "  ② 在 config.json 的 first_hop_process_names 里填上你机场\n"
+                 "     客户端的所有 .exe 进程名（含 GUI 主进程和它派生的代理引擎）\n\n"
+                 f"配置文件：{core.CONFIG_PATH}",
+                 critical=True)
+            return
         try:
             yaml = core.build_mihomo_yaml(self.cfg)
         except Exception as e:
             fail("配置错误", str(e), critical=True)
             return
-        core.MIHOMO_YAML.write_text(yaml)
+        core.MIHOMO_YAML.write_text(yaml, encoding="utf-8")
         use_sudo = bool(self.cfg.get("tun_mode"))
         try:
             self.runner.start(self.mihomo_bin, use_sudo=use_sudo)
         except Exception as e:
             fail("启动失败", str(e), critical=True)
             return
+        # CRITICAL: confirm mihomo actually came up before touching system
+        # proxy. If it spawned and then crashed (bad config, port in use,
+        # missing rule-set file) we must NOT point Windows at a dead port.
+        # We poll the controller socket up to 2s — that's the most
+        # authoritative liveness check available without async I/O.
+        if not self._wait_until_listening(int(self.cfg["controller_port"]),
+                                          timeout_s=2.0):
+            try:
+                self.runner.stop()
+            except Exception:
+                pass
+            tail = self._tail_mihomo_log(20)
+            fail("mihomo 启动后立即崩溃",
+                 f"端口 {self.cfg['controller_port']} 在 2 秒内未监听。\n\n"
+                 f"最近日志：\n{tail or '(空)'}",
+                 critical=True)
+            return
         if self.cfg.get("set_system_proxy_on_start") and not use_sudo:
             self.toggle_system_proxy(True)
         elif use_sudo:
             self.log("TUN 模式已启用，无需设系统代理")
         self._tick()
+
+    def _cleanup_orphan_proxy_state(self):
+        """Windows-only: a previous GUI session crashed/was killed while it
+        owned the system proxy. The snapshot file is the marker. Restore the
+        original registry values now so the user has working internet."""
+        try:
+            backup_path = core.SUPPORT_DIR / ".proxy_backup.json"
+            if not backup_path.exists():
+                return
+            self.log("⚠ 检测到上次 GUI 异常退出时未还原系统代理，自动清理…")
+            ok, info = core.set_system_proxy(0, enable=False)
+            self.log(f"  系统代理状态：{info if ok else 'error: ' + info}")
+        except Exception as e:
+            self.log(f"启动清理失败：{e}")
+
+    @staticmethod
+    def _wait_until_listening(port: int, timeout_s: float = 2.0,
+                              host: str = "127.0.0.1") -> bool:
+        import socket as _s
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                with _s.create_connection((host, port), timeout=0.3):
+                    return True
+            except OSError:
+                time.sleep(0.1)
+        return False
+
+    def _tail_mihomo_log(self, n: int = 20) -> str:
+        try:
+            txt = core.MIHOMO_LOG.read_text(encoding="utf-8", errors="replace")
+            return "\n".join(txt.splitlines()[-n:])
+        except OSError:
+            return ""
 
     def stop(self, cancel_pending_restart: bool = True):
         if cancel_pending_restart and hasattr(self, "_restart_timer"):
@@ -1996,13 +2162,18 @@ class MainWindow(QMainWindow):
             self.log(f"{'已设为' if on else '已清除'}系统代理（{info}）")
             self.toast(f"{'已设为' if on else '已清除'}系统代理")
         else:
-            QMessageBox.warning(self, "失败",
-                f"networksetup 出错：{info}\n你可能需要 sudo 权限。")
+            if sys.platform == "darwin":
+                detail = f"networksetup 出错：{info}\n你可能需要 sudo 权限。"
+            else:
+                detail = f"写入注册表失败：{info}"
+            QMessageBox.warning(self, "失败", detail)
 
     def panic_recover(self):
-        if QMessageBox.question(self, "网络急救",
-                "执行：清系统代理 + 杀残留 mihomo + 删 TUN 路由 + 关 utun。\n\n"
-                "继续？") != QMessageBox.StandardButton.Yes:
+        if sys.platform == "darwin":
+            prompt = "执行：清系统代理 + 杀残留 mihomo + 删 TUN 路由 + 关 utun。\n\n继续？"
+        else:
+            prompt = "执行：清系统代理 + 杀残留 mihomo.exe（WinTun 由 mihomo 自行清理）。\n\n继续？"
+        if QMessageBox.question(self, "网络急救", prompt) != QMessageBox.StandardButton.Yes:
             return
         def worker():
             try: self.runner.stop()
@@ -2011,24 +2182,145 @@ class MainWindow(QMainWindow):
             self.qt_invoke(lambda: self.toast("已恢复网络"))
         threading.Thread(target=worker, daemon=True).start()
 
+    # ── system tray ───────────────────────────────────────────────────────
+    def _build_tray(self):
+        """Create the tray icon. Closing the window minimizes to tray instead
+        of quitting; quit happens only via the tray menu's '退出' or Ctrl+Q."""
+        self._tray_quit = False  # set by tray-quit / Ctrl+Q to allow real exit
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = None
+            return
+
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = self.q_app.windowIcon()
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("ChainProxy")
+
+        menu = QMenu(self)
+        act_show = QAction("打开主窗口", self)
+        act_show.triggered.connect(self._show_window)
+        act_toggle = QAction("启动 / 停止", self)
+        act_toggle.triggered.connect(self._toggle_run)
+        act_quit = QAction("退出 ChainProxy", self)
+        act_quit.triggered.connect(self._quit_via_tray)
+        menu.addAction(act_show)
+        menu.addAction(act_toggle)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+        # Ctrl+Q: explicit quit shortcut (tray menu also has it)
+        sc_quit = QShortcut(QKeySequence("Ctrl+Q"), self)
+        sc_quit.activated.connect(self._quit_via_tray)
+
+    def _on_tray_activated(self, reason):
+        # Trigger = double-click on Windows / single-click on macOS by default
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._show_window()
+
+    def _show_window(self):
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_via_tray(self):
+        self._tray_quit = True
+        self.close()
+
     def closeEvent(self, e):
+        # Closing the window without an explicit quit minimizes to the tray
+        # so the proxy keeps running. Hide rather than terminate.
+        if self.tray and self.tray.isVisible() and not self._tray_quit:
+            e.ignore()
+            self.hide()
+            # First time: tell the user where the app went, otherwise people
+            # think it crashed. The flag is per-process — fine for our needs.
+            if not getattr(self, "_tray_hint_shown", False):
+                self._tray_hint_shown = True
+                try:
+                    self.tray.showMessage(
+                        "ChainProxy 仍在运行",
+                        "已最小化到通知区。点击图标打开，或右键选「退出 ChainProxy」彻底关闭。",
+                        QSystemTrayIcon.MessageIcon.Information, 4000)
+                except Exception:
+                    pass
+            return
+
+        # Real quit: stop mihomo, restore proxy, close.
         if self.runner.is_running():
             r = QMessageBox.question(self, "退出",
                 "代理仍在运行。退出会停止代理。继续？")
             if r != QMessageBox.StandardButton.Yes:
-                e.ignore(); return
+                e.ignore()
+                self._tray_quit = False  # cancel: don't quit, but don't hide either
+                return
             try: self.runner.stop()
             except Exception: pass
             if self._we_set_proxy:
                 self.toggle_system_proxy(False)
             if self.cfg.get("tun_mode"):
                 core.panic_recover(self.log)
+        if self.tray:
+            self.tray.hide()
         e.accept()
 
 
 # ─── Entry ─────────────────────────────────────────────────────────────────
 
+def _resource_path(relative: str) -> str:
+    """Return an absolute path to a bundled resource that works both when
+    running from source and from a PyInstaller --onedir build."""
+    if getattr(sys, "frozen", False):
+        # PyInstaller: resources live under sys._MEIPASS (one-file) or
+        # alongside the exe (--onedir).
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, relative)
+
+
+def _find_app_icon() -> str:
+    """Pick the best icon file for QApplication.setWindowIcon. Windows
+    prefers .ico (multi-resolution); macOS/Linux prefer .png. We try .ico
+    first on Windows to ensure the taskbar uses the correct resolution."""
+    candidates = (("icon.ico", "icon.png") if sys.platform == "win32"
+                  else ("icon.png", "icon.ico"))
+    for name in candidates:
+        p = _resource_path(name)
+        if os.path.exists(p):
+            return p
+    return ""
+
+
 def main():
+    # Windows + TUN mode: re-launch self elevated. This trades a single UAC
+    # prompt at startup for zero UAC prompts on every start/stop of mihomo.
+    # (Without this, every start AND every stop of TUN-mode mihomo pops UAC
+    # — a worse UX than other Windows proxy clients.)
+    if sys.platform == "win32":
+        try:
+            cfg_peek = core.load_config()
+            need_elevation = bool(cfg_peek.get("tun_mode"))
+        except Exception:
+            need_elevation = False
+        if need_elevation and not core.is_elevated():
+            # Spawn elevated copy and exit. The elevated copy will acquire
+            # the single-instance lock; this unelevated copy never reaches
+            # that point so they don't fight each other.
+            ok = core.relaunch_elevated()
+            if ok:
+                sys.exit(0)
+            # If the user cancelled UAC, fall through to a non-elevated GUI.
+            # mihomo TUN start will then fail with a clear error — better
+            # than silently doing nothing.
+
     lock = core.acquire_single_instance_lock()
     if lock is None:
         core.activate_existing_window()
@@ -2036,10 +2328,26 @@ def main():
 
     QApplication.setApplicationName(core.APP_NAME)
     QApplication.setOrganizationName("ChainProxy")
+    # Windows: tell Windows this is a distinct app for taskbar grouping
+    # purposes, otherwise it groups under "python.exe" / "ChainProxy" and
+    # reuses python's icon. AppUserModelID needs to match the .exe file.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "Laogeyouge.ChainProxy.GUI.1")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")  # consistent base, themed via QSS
+    icon_path = _find_app_icon()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
 
     w = MainWindow(app)
+    if icon_path:
+        w.setWindowIcon(QIcon(icon_path))
     w.show()
     w.raise_()
     w.activateWindow()
