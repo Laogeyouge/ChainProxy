@@ -4,12 +4,12 @@
 > 基于 [mihomo](https://github.com/MetaCubeX/mihomo) 内核，PyQt6 写的原生外观。
 
 <p align="center">
-  <img src="ChainProxy.app/Contents/Resources/ChainProxy.icns" width="120" alt="ChainProxy 图标">
+  <img src="icon.png" width="120" alt="ChainProxy 图标">
 </p>
 
 ## 这是什么
 
-很多机场客户端只能让你出一跳。ChainProxy 让你在**第一跳已经稳定可用**的基础上，把指定流量再串到**第二跳**节点上去——常见用途：
+很多机场客户端只能让你出一跳。ChainProxy 让你在**已经能用的第一跳**基础上，把指定流量再串到**第二跳**节点上去——常见用途：
 
 - 已有的机场出口 IP 在某些境外服务（OpenAI / Anthropic / Google AI 等）那里被风控，但你还有一个干净的二跳 VPS 想接力使用
 - 想让大部分流量走机场（速度快），少数关键域名再多绕一跳（IP 干净）
@@ -18,18 +18,21 @@
 工作原理：
 
 ```
- ┌─ macOS 本机 ─┐    ┌─ 第一跳（机场 SOCKS5） ─┐    ┌─ 第二跳（你的节点） ─┐    ┌─ 目标 ─┐
- │   App 流量    │ ──▶│   FastLink / V2Ray / …    │ ──▶│   trojan / ss / …       │ ──▶│  互联网 │
- └──────────────┘    └────────────────────────┘    └──────────────────────┘    └────────┘
-                            ▲                              ▲
-                            │                              │
+ ┌─ macOS 本机 ─┐    ┌───── 第一跳 ─────┐    ┌──── 第二跳 ────┐    ┌─ 目标 ─┐
+ │   App 流量    │ ──▶│  机场客户端的       │ ──▶│  你自己的节点      │ ──▶│  互联网 │
+ │              │    │  本地 SOCKS5         │    │  trojan / ss / …  │    │        │
+ └──────────────┘    └───────────────────┘    └─────────────────┘    └────────┘
+                            ▲                          ▲
+                            │                          │
                        由 mihomo 用 dialer-proxy 串起来，分流策略由你指定
 ```
+
+第一跳是**任何在 `127.0.0.1:某端口` 暴露 SOCKS5 的机场客户端**——ClashX、V2RayX、Karing、FastLink、Stash、自建 mihomo 等等都行。第二跳是**你自己的 VPS 或干净节点**，协议支持 socks5 / http / trojan / ss / vmess / hysteria2。
 
 ## 主要功能
 
 - **一键启停链式代理**，状态、链路可视化，TUN / 系统代理两种模式可选
-- **直接编辑分流规则**：内置 13 个 Loyalsoldier clash-rules 规则集，每行可直接点开关 / 切换"命中后走哪一跳"
+- **直接编辑分流规则**：内置 13 个 [Loyalsoldier clash-rules](https://github.com/Loyalsoldier/clash-rules) 规则集，每行可直接点开关 / 切换"命中后走哪一跳"
 - **自定义规则前/后置**：支持 `DOMAIN-SUFFIX` / `DOMAIN-KEYWORD` / `IP-CIDR` / `PROCESS-NAME` 等所有 mihomo 规则语法
 - **规则测试页**：发一个 HTTP 请求，看它命中了哪条规则、最终从哪个节点出去
 - **网络急救按钮**：一键清系统代理 / 杀残留 mihomo / 删 TUN 路由 / 关 utun，断网时救命用
@@ -82,12 +85,12 @@ bash scripts/make_dmg.sh 1.0.0
 
 ## 使用
 
-1. **打开你的机场客户端**（FastLink / ClashX / V2RayX 等），关掉它自己的 "系统代理" 和 "TUN" 开关，只让它在 `127.0.0.1:某端口` 暴露一个 SOCKS5
+1. **打开你的机场客户端**（任何能输出 SOCKS5 的都行：ClashX / V2RayX / Karing / Stash / FastLink / 自建 mihomo …），关掉它自己的"系统代理"和"TUN"开关，只让它在 `127.0.0.1:某端口` 暴露一个 SOCKS5
 2. 打开 ChainProxy，去**节点**页：
-   - 第一跳：填机场客户端那个本地 SOCKS5 端口
-   - 第二跳：填你的二跳节点（trojan / ss / vmess / hysteria2 / socks5 都行）
+   - **第一跳**：填机场客户端那个本地 SOCKS5 端口（比如 `127.0.0.1:7891`）
+   - **第二跳**：填你的二跳节点（trojan / ss / vmess / hysteria2 / socks5 都行）
 3. 去**分流规则**页：
-   - 默认规则集里 `proxy` / `gfw` / `google` / `tld-not-cn` 等都走 **FastLinkOnly**（只走第一跳）
+   - 默认规则集里 `proxy` / `gfw` / `google` / `tld-not-cn` 等都走 **FirstHopOnly**（只走第一跳）
    - **自定义规则前置**里写你想强制走第二跳的域名，目标填 `Chain`
    - 改完任何规则会自动保存，1.5 秒去抖后自动重启 mihomo
 4. 回**概览**页点 **启动**，搞定
@@ -97,7 +100,7 @@ bash scripts/make_dmg.sh 1.0.0
 | 目标 | 含义 |
 |:--|:--|
 | `Chain` | 走完整链路：本机 → 第一跳 → 第二跳 → 目标 |
-| `FastLinkOnly` | 只走第一跳：本机 → 第一跳 → 目标（适合大部分代理流量） |
+| `FirstHopOnly` | 只走第一跳：本机 → 第一跳 → 目标（适合大部分代理流量） |
 | `DIRECT` | 直连，不走任何代理 |
 | `REJECT` | 拒绝（用于广告 / 隐私域名） |
 
@@ -106,6 +109,12 @@ bash scripts/make_dmg.sh 1.0.0
 - 默认是**系统代理模式**（设置 macOS 的 SOCKS5 / HTTP 代理）。优点：不用密码、卸载干净；缺点：只能接管"会读系统代理"的应用
 - **TUN 模式**会在系统里建一个虚拟网卡接管所有 IPv4 流量，包括 Telegram / 游戏 / 任何不读系统代理的程序。第一次开启会要管理员密码（装一个 sudoers 免密助手），之后再开 TUN 不需要密码
 - ⚠️ **务必关闭机场客户端自带的 TUN**——两个 TUN 同时开会路由打架
+- ⚠️ TUN 模式下要在 `config.json` 里把你机场客户端的所有进程名加到 `first_hop_process_names`，否则会出现回环（机场自己的拨号被 TUN 抓回来 → 转给自己 → 又被抓 → 超时）。每种机场客户端的进程名不一样，常见的：
+  - ClashX：`["ClashX", "ClashX Pro"]`
+  - Karing：`["Karing", "sing-box"]`
+  - FastLink：`["FastLink机场", "AtlasCore_arm64", "AtlasCore_amd64"]`
+  - 自建 mihomo：`["mihomo"]`
+  - 不确定就在 Activity Monitor 里看你的客户端在跑哪些进程
 - 如果断网或者出问题，回**概览**页点**网络急救**：一键清系统代理 + 杀 mihomo + 删 TUN 路由
 
 ## 配置文件
@@ -126,13 +135,14 @@ cp config.example.json ~/Library/Application\ Support/ChainProxy/config.json
 ChainProxy/
 ├── chainproxy_qt.py            ← GUI（PyQt6）
 ├── chainproxy_core.py          ← 后端：mihomo runner / config / 系统代理 / TUN 助手
-├── config.example.json         ← 示例配置（含自定义规则；节点字段是占位符）
+├── config.example.json         ← 示例配置（节点字段是占位符，规则示例）
+├── icon.png                    ← README 用的 PNG（GitHub 不能渲染 .icns）
 ├── ChainProxy.app/             ← .app 骨架（Info.plist + 启动器 + 图标）
 │   └── Contents/{Info.plist,MacOS/ChainProxy,Resources/ChainProxy.icns}
 └── scripts/
     ├── build.sh                ← 把 .py 拷进 .app 打包成自包含 bundle
     ├── make_dmg.sh             ← 打成可拖装的 .dmg
-    └── make_icon.py            ← 重新生成 .icns 图标
+    └── make_icon.py            ← 重新生成 .icns + icon.png
 ```
 
 ## 数据 / 文件位置

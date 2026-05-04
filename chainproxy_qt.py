@@ -1123,7 +1123,7 @@ class RulesPage(QWidget):
 
         self.final_combo = QComboBox()
         self.final_combo.addItems([t for t in core.RULE_TARGETS if t != "REJECT"])
-        self.final_combo.setCurrentText(app.cfg.get("final_target", "FastLinkOnly"))
+        self.final_combo.setCurrentText(app.cfg.get("final_target", "FirstHopOnly"))
         self.final_combo.setMinimumWidth(160)
         self.final_combo.setMinimumHeight(28)
         self.final_combo.currentTextChanged.connect(self._on_final_change)
@@ -1162,7 +1162,7 @@ class RulesPage(QWidget):
             hbox(L("自定义规则", "cardTitle"), "stretch",
                  L("失焦自动保存", "mute")),
             L("一行一条，优先级最高。语法：DOMAIN-SUFFIX,host,目标   ·   "
-              "目标可填 Chain / FastLinkOnly / DIRECT / REJECT", "rowSub"),
+              "目标可填 Chain / FirstHopOnly / DIRECT / REJECT", "rowSub"),
             self.pre_edit,
             divider(soft=True),
             L("后置规则（极少用）", "rowLabel"),
@@ -1581,7 +1581,7 @@ class SettingsPage(QWidget):
                 "TUN 模式", self.tun_chk,
                 "接管系统所有 IPv4 流量。第一次启用会要求管理员密码。"),
             L("• 开启后无需配置 SOCKS5 / 系统代理\n"
-              "• FastLink 自身的 TUN 必须关闭\n"
+              "• 你的机场客户端自身的 TUN 必须关闭\n"
               "• 异常断网时回到「概览」点「网络急救」", "rowSub"),
             spacing=10,
         )
@@ -1654,7 +1654,7 @@ class SettingsPage(QWidget):
                 "已启用 TUN 模式。\n\n"
                 "• 第一次启动时需输入管理员密码（之后免密）\n"
                 "• 异常断网时点「网络急救」恢复\n"
-                "• FastLink 自身的 TUN 必须关闭")
+                "• 你的机场客户端自身的 TUN 必须关闭")
         self.app.on_config_change()
         if self.app.runner.is_running():
             self.app.maybe_restart_for_config_change(silent=True)
@@ -1953,7 +1953,7 @@ class MainWindow(QMainWindow):
         if not core.tcp_reachable(fh["server"], fh["port"], timeout=2):
             fail("第一跳不可达",
                  f"无法连接 {fh['server']}:{fh['port']}（{fh['name']}）。\n\n"
-                 "请先打开 FastLink 客户端，并关闭它的「系统代理」「TUN」开关。")
+                 "请先打开你的第一跳机场客户端，并关闭它的「系统代理」「TUN」开关。")
             return
         try:
             yaml = core.build_mihomo_yaml(self.cfg)

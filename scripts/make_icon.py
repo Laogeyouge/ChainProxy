@@ -92,6 +92,12 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
 
     master = make_master(1024)
+
+    # Also save a 512×512 PNG at the repo root so GitHub's README can render it
+    # (.icns isn't supported by GitHub's image renderer).
+    png_out = repo_root / "icon.png"
+    master.resize((512, 512), Image.LANCZOS).save(png_out, "PNG")
+    print(f"✓ {png_out}  ({png_out.stat().st_size:,} bytes)")
     targets = [
         ("icon_16x16.png", 16), ("icon_16x16@2x.png", 32),
         ("icon_32x32.png", 32), ("icon_32x32@2x.png", 64),

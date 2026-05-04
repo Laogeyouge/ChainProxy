@@ -6,12 +6,12 @@
   "controller_secret": "chainproxy",
   "set_system_proxy_on_start": true,
   "tun_mode": false,
-  "active_first_hop": "FastLink",
+  "active_first_hop": "我的机场",
   "active_second_hop": "我的二跳",
 
   "first_hops": [
     {
-      "name": "FastLink",
+      "name": "我的机场",
       "type": "socks5",
       "server": "127.0.0.1",
       "port": 6666,
@@ -39,11 +39,8 @@
     }
   ],
 
-  "first_hop_process_names": [
-    "FastLink机场",
-    "AtlasCore_arm64",
-    "AtlasCore_amd64"
-  ],
+  "first_hop_process_names": [],
+  "_first_hop_process_names_help": "仅 TUN 模式需要。把你第一跳机场客户端的所有可执行程序名填进去（含 GUI 进程和它派生的代理引擎），否则 TUN 会把客户端自己的拨号流量回环捕获，10 秒后报 'context deadline exceeded'。常见示例：FastLink → ['FastLink机场','AtlasCore_arm64','AtlasCore_amd64']；ClashX → ['ClashX','ClashX Pro']；Karing → ['Karing','sing-box']。",
 
   "rule_sets": [
     {"name": "reject", "behavior": "domain", "target": "REJECT",
@@ -64,19 +61,19 @@
     {"name": "apple", "behavior": "domain", "target": "DIRECT",
      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/apple.txt",
      "enabled": true, "desc": "Apple 服务"},
-    {"name": "google", "behavior": "domain", "target": "FastLinkOnly",
+    {"name": "google", "behavior": "domain", "target": "FirstHopOnly",
      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/google.txt",
      "enabled": true, "desc": "Google 服务（走第一跳）"},
-    {"name": "proxy", "behavior": "domain", "target": "FastLinkOnly",
+    {"name": "proxy", "behavior": "domain", "target": "FirstHopOnly",
      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt",
      "enabled": true, "desc": "常见需代理的境外域名"},
-    {"name": "gfw", "behavior": "domain", "target": "FastLinkOnly",
+    {"name": "gfw", "behavior": "domain", "target": "FirstHopOnly",
      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt",
      "enabled": true, "desc": "GFW 黑名单域名"},
-    {"name": "tld-not-cn", "behavior": "domain", "target": "FastLinkOnly",
+    {"name": "tld-not-cn", "behavior": "domain", "target": "FirstHopOnly",
      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/tld-not-cn.txt",
      "enabled": true, "desc": "非 .cn 顶级域名"},
-    {"name": "telegramcidr", "behavior": "ipcidr", "target": "FastLinkOnly",
+    {"name": "telegramcidr", "behavior": "ipcidr", "target": "FirstHopOnly",
      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/telegramcidr.txt",
      "enabled": true, "desc": "Telegram IP 段"},
     {"name": "lancidr", "behavior": "ipcidr", "target": "DIRECT",
@@ -109,7 +106,7 @@
 
   "custom_rules_post": [],
 
-  "final_target": "FastLinkOnly",
+  "final_target": "FirstHopOnly",
   "rules_enabled": true,
   "theme": "auto"
 }

@@ -195,7 +195,7 @@ def install_helper():
             (result.stderr or "").strip() or "授权被取消"
         )
 
-RULE_TARGETS = ["Chain", "FastLinkOnly", "DIRECT", "REJECT"]
+RULE_TARGETS = ["Chain", "FirstHopOnly", "DIRECT", "REJECT"]
 
 # Loyalsoldier/clash-rules — the de-facto standard mainland China rule set,
 # regenerated daily. Mirrors via jsDelivr CDN for fast access from China.
@@ -220,19 +220,19 @@ DEFAULT_RULE_SETS = [
     {"name": "apple", "behavior": "domain", "target": "DIRECT",
      "url": f"{LOYALSOLDIER_BASE}/apple.txt", "enabled": False,
      "desc": "Apple 服务（默认直连）"},
-    {"name": "google", "behavior": "domain", "target": "FastLinkOnly",
+    {"name": "google", "behavior": "domain", "target": "FirstHopOnly",
      "url": f"{LOYALSOLDIER_BASE}/google.txt", "enabled": True,
      "desc": "Google 服务（走第一跳）"},
-    {"name": "proxy", "behavior": "domain", "target": "FastLinkOnly",
+    {"name": "proxy", "behavior": "domain", "target": "FirstHopOnly",
      "url": f"{LOYALSOLDIER_BASE}/proxy.txt", "enabled": True,
      "desc": "常见需代理的境外域名（走第一跳）"},
-    {"name": "gfw", "behavior": "domain", "target": "FastLinkOnly",
+    {"name": "gfw", "behavior": "domain", "target": "FirstHopOnly",
      "url": f"{LOYALSOLDIER_BASE}/gfw.txt", "enabled": True,
      "desc": "GFW 黑名单域名（走第一跳）"},
-    {"name": "tld-not-cn", "behavior": "domain", "target": "FastLinkOnly",
+    {"name": "tld-not-cn", "behavior": "domain", "target": "FirstHopOnly",
      "url": f"{LOYALSOLDIER_BASE}/tld-not-cn.txt", "enabled": True,
      "desc": "非 .cn 顶级域名（走第一跳）"},
-    {"name": "telegramcidr", "behavior": "ipcidr", "target": "FastLinkOnly",
+    {"name": "telegramcidr", "behavior": "ipcidr", "target": "FirstHopOnly",
      "url": f"{LOYALSOLDIER_BASE}/telegramcidr.txt", "enabled": True,
      "desc": "Telegram IP 段（走第一跳）"},
     {"name": "lancidr", "behavior": "ipcidr", "target": "DIRECT",
@@ -249,16 +249,18 @@ DEFAULT_CONFIG = {
     "controller_secret": "chainproxy",
     "set_system_proxy_on_start": False,
     "tun_mode": False,
-    # ALL of FastLink's executables that may originate outbound packets.
-    # Missing any one of these causes a TUN routing loop:
-    #   AtlasCore (the Go engine) dials FastLink's VPN node →
-    #   TUN captures it → no PROCESS-NAME match → falls through to MATCH,Chain →
-    #   routed back through FastLink → re-captured → context deadline exceeded.
-    "first_hop_process_names": [
-        "FastLink机场",     # Flutter GUI
-        "AtlasCore_arm64",  # actual proxy engine on Apple Silicon
-        "AtlasCore_amd64",  # actual proxy engine on Intel
-    ],
+    # In TUN mode we add PROCESS-NAME,...,DIRECT rules so the first-hop
+    # client's outbound packets aren't recaptured by our own TUN — that loop
+    # would route the airport client's VPN dial back through itself, dying
+    # with "context deadline exceeded".
+    # Fill in EVERY binary your airport client may originate packets from
+    # (GUI process AND any helper engines it spawns). Examples for some
+    # popular Chinese-airport clients:
+    #   FastLink:  "FastLink机场", "AtlasCore_arm64", "AtlasCore_amd64"
+    #   ClashX:    "ClashX", "ClashX Pro", "com.west2online.ClashXHelper"
+    #   Karing:    "Karing", "sing-box"
+    # Empty by default — add via config.json or by editing first_hop_process_names.
+    "first_hop_process_names": [],
     "active_first_hop": "",
     "active_second_hop": "",
     "first_hops": [],
@@ -268,12 +270,12 @@ DEFAULT_CONFIG = {
     "rule_sets_last_update": "",
     "custom_rules_pre": [],
     "custom_rules_post": [],
-    # Final fallback for traffic not matching any rule. Default = FastLinkOnly:
+    # Final fallback for traffic not matching any rule. Default = FirstHopOnly:
     # send everything through the fast/stable first hop, and only divert
     # specific domains to Chain (second hop) via custom_rules_pre.
-    "final_target": "FastLinkOnly",
+    "final_target": "FirstHopOnly",
     # Built-in rule sets ON by default — they handle reject/direct/cncidr etc.
-    # Their proxy targets all point at FastLinkOnly (first hop) so the second
+    # Their proxy targets all point at FirstHopOnly (first hop) so the second
     # hop is reserved exclusively for traffic the user routes there via
     # custom rules.
     "rules_enabled": True,
@@ -293,22 +295,43 @@ def load_config():
         cfg = json.loads(CONFIG_PATH.read_text())
     except Exception:
         cfg = dict(DEFAULT_CONFIG)
+    migrated = False
     for k, v in DEFAULT_CONFIG.items():
-        cfg.setdefault(k, v)
+        if k not in cfg:
+            cfg[k] = v
+            migrated = True
     # Migrate rule_sets: if user has an older list, fold in any new defaults
     # (by name) without disturbing user-altered entries.
     existing_names = {r.get("name") for r in cfg.get("rule_sets", [])}
     for default_rule in DEFAULT_RULE_SETS:
         if default_rule["name"] not in existing_names:
             cfg["rule_sets"].append(dict(default_rule))
-    # Migrate first_hop_process_names: union user's list with defaults, so
-    # adding new FastLink binaries (e.g., AtlasCore) auto-fixes existing
-    # installs without losing any custom entries.
-    user_procs = list(cfg.get("first_hop_process_names") or [])
-    for default_proc in DEFAULT_CONFIG["first_hop_process_names"]:
-        if default_proc not in user_procs:
-            user_procs.append(default_proc)
-    cfg["first_hop_process_names"] = user_procs
+            migrated = True
+    # Migrate legacy "FastLinkOnly" rule target → "FirstHopOnly" (renamed in
+    # 1.1.0 for clarity; older configs from 1.0.x still write the old name).
+    if cfg.get("final_target") == "FastLinkOnly":
+        cfg["final_target"] = "FirstHopOnly"
+        migrated = True
+    for rs in cfg.get("rule_sets", []) or []:
+        if rs.get("target") == "FastLinkOnly":
+            rs["target"] = "FirstHopOnly"
+            migrated = True
+    for key in ("custom_rules_pre", "custom_rules_post"):
+        new = []
+        for ln in (cfg.get(key) or []):
+            if isinstance(ln, str) and ",FastLinkOnly" in ln:
+                new.append(ln.replace(",FastLinkOnly", ",FirstHopOnly"))
+                migrated = True
+            else:
+                new.append(ln)
+        cfg[key] = new
+    # first_hop_process_names: take whatever the user has, no auto-augment —
+    # this list is airport-client specific and we have no business adding
+    # entries the user didn't ask for.
+    cfg["first_hop_process_names"] = list(
+        cfg.get("first_hop_process_names") or [])
+    if migrated:
+        save_config(cfg)
     return cfg
 
 
@@ -412,7 +435,7 @@ def proxy_to_mihomo(p):
 
 def _normalize_target(t):
     """Map our internal target names to the actual proxy/group names mihomo
-    will see. FastLinkOnly is a proxy-group (defined below)."""
+    will see. FirstHopOnly is a proxy-group (defined below)."""
     return t  # names match
 
 
@@ -504,13 +527,13 @@ def build_mihomo_yaml(cfg):
         "find-process-mode": "always" if cfg.get("tun_mode") else "off",
         "proxies": [fh_proxy, sh_proxy],
         "proxy-groups": [
-            # Full chain: FastLink → second hop → target
+            # Full chain: first hop → second hop → target
             {"name": "Chain", "type": "select", "proxies": [sh["name"]]},
-            # First-hop only: skip second hop, exit through FastLink
-            {"name": "FastLinkOnly", "type": "select", "proxies": [fh["name"]]},
+            # First-hop only: skip the second hop, exit through the first hop
+            {"name": "FirstHopOnly", "type": "select", "proxies": [fh["name"]]},
             # Convenience group
             {"name": "GLOBAL", "type": "select",
-             "proxies": ["Chain", "FastLinkOnly", "DIRECT"]},
+             "proxies": ["Chain", "FirstHopOnly", "DIRECT"]},
         ],
         "rules": rules,
     }
@@ -766,7 +789,7 @@ def test_url_through_proxy(url, local_port, log_path, timeout=15):
                 if m:
                     rule = m.group(1)
                     proxy_full = m.group(2)
-                    # proxy_full is like "Chain[SecondHop]" or "DIRECT" or "FastLinkOnly[FastLink]"
+                    # proxy_full is like "Chain[SecondHop]" or "DIRECT" or "FirstHopOnly[FirstHop]"
                     if "[" in proxy_full:
                         chain, proxy = proxy_full.split("[", 1)
                         proxy = proxy.rstrip("]")
