@@ -7,27 +7,61 @@ RES="$(cd "$HERE/../Resources" && pwd)"
 LOGDIR="$HOME/Library/Application Support/ChainProxy/runtime"
 mkdir -p "$LOGDIR"
 
-# Prefer python3 from PATH, fall back to common Homebrew locations so a
-# double-click from Finder (which has a minimal PATH) still finds python3.
+# Build a candidate list of python3 binaries from common install locations.
+# Order matters — we search top to bottom, picking the first one that has
+# PyQt6 importable. Apple's /usr/bin/python3 goes last because it never has
+# PyQt6 by default and acts only as a fallback to show an actionable message.
+CANDS=()
+[ -n "$(command -v python3 2>/dev/null)" ] && CANDS+=("$(command -v python3)")
+
+# Conda / Miniconda / Anaconda (active env first, then base envs)
+[ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/python3" ] && CANDS+=("$CONDA_PREFIX/bin/python3")
+for base in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/opt/miniconda3" "$HOME/opt/anaconda3" /opt/miniconda3 /opt/anaconda3; do
+  [ -x "$base/bin/python3" ] && CANDS+=("$base/bin/python3")
+done
+
+# Homebrew (Apple Silicon + Intel) — try versioned then unversioned
+for prefix in /opt/homebrew /usr/local; do
+  for v in 3.13 3.12 3.11 3.10 3.9 ""; do
+    [ -x "$prefix/bin/python$v" ] && CANDS+=("$prefix/bin/python$v")
+  done
+done
+
+# pyenv
+[ -x "$HOME/.pyenv/shims/python3" ] && CANDS+=("$HOME/.pyenv/shims/python3")
+
+# Python.org official installer
+for v in 3.13 3.12 3.11 3.10 3.9; do
+  fw="/Library/Frameworks/Python.framework/Versions/$v/bin/python3"
+  [ -x "$fw" ] && CANDS+=("$fw")
+done
+
+# Apple's stub (last resort)
+CANDS+=("/usr/bin/python3")
+
+# Find first candidate with PyQt6.
 PY=""
-for cand in \
-    "$(command -v python3 2>/dev/null)" \
-    /opt/homebrew/bin/python3 \
-    /usr/local/bin/python3 \
-    /usr/bin/python3 ; do
-  if [ -x "$cand" ]; then PY="$cand"; break; fi
+ANY_PY=""
+for cand in "${CANDS[@]}"; do
+  [ -x "$cand" ] || continue
+  [ -z "$ANY_PY" ] && ANY_PY="$cand"
+  if "$cand" -c "import PyQt6" >/dev/null 2>&1; then
+    PY="$cand"
+    break
+  fi
 done
 
 if [ -z "$PY" ]; then
-  /usr/bin/osascript -e 'display alert "ChainProxy" message "未找到 python3。请先安装 Python 3：brew install python"'
+  if [ -n "$ANY_PY" ]; then
+    /usr/bin/osascript -e "display alert \"ChainProxy\" message \"找到 python3，但没装 PyQt6。请打开终端运行：\n\n$ANY_PY -m pip install PyQt6\"" >/dev/null
+  else
+    /usr/bin/osascript -e 'display alert "ChainProxy" message "未找到 python3。请先安装 Python 3：brew install python"' >/dev/null
+  fi
   exit 1
 fi
 
-# Fail early with a clear message if PyQt6 isn't installed.
-if ! "$PY" -c "import PyQt6" >/dev/null 2>&1; then
-  /usr/bin/osascript -e 'display alert "ChainProxy" message "缺少 PyQt6。请运行：pip3 install PyQt6"'
-  exit 1
-fi
+# Record which interpreter we picked so app.log shows the path used.
+echo "[launcher $(date '+%H:%M:%S')] using $PY" >> "$LOGDIR/app.log"
 
 cd "$RES"
 exec "$PY" "$RES/chainproxy_qt.py" >> "$LOGDIR/app.log" 2>&1

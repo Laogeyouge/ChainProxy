@@ -99,9 +99,25 @@ DARK = {
 }
 
 
+# Per-platform font stacks. Listing fonts that don't exist on the current OS
+# triggers Qt's "Replace uses of missing font family X" warning every paint.
+# Qt QSS does NOT recognize CSS generic family names (sans-serif/monospace)
+# — it treats them as literal font names — so we list only real installed
+# families and let Qt's own default font kick in if all of them are missing.
+if sys.platform == "darwin":
+    _UI_FONTS = '".AppleSystemUIFont", "Helvetica Neue"'
+    _MONO_FONTS = '"Menlo"'
+elif sys.platform == "win32":
+    _UI_FONTS = '"Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"'
+    _MONO_FONTS = '"Consolas", "Cascadia Mono"'
+else:
+    _UI_FONTS = '"DejaVu Sans", "Liberation Sans"'
+    _MONO_FONTS = '"DejaVu Sans Mono", "Liberation Mono"'
+
+
 def stylesheet(c: dict) -> str:
     return f"""
-* {{ font-family: ".AppleSystemUIFont", "Helvetica Neue", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; }}
+* {{ font-family: {_UI_FONTS}; }}
 
 QMainWindow, QDialog {{ background: {c['window']}; }}
 QWidget#root, QWidget#page {{ background: {c['window']}; color: {c['text']}; }}
@@ -118,7 +134,7 @@ QLabel.rowLabel     {{ font-size: 13px; font-weight: 500; color: {c['text']}; }}
 QLabel.rowSub       {{ font-size: 12px; color: {c['text_dim']}; }}
 QLabel.dim          {{ font-size: 12px; color: {c['text_dim']}; }}
 QLabel.mute         {{ font-size: 12px; color: {c['text_mute']}; }}
-QLabel.mono         {{ font-family: "Menlo", "Consolas", "Cascadia Mono", monospace; font-size: 12px; color: {c['text']}; }}
+QLabel.mono         {{ font-family: {_MONO_FONTS}; font-size: 12px; color: {c['text']}; }}
 QLabel.statHero     {{ font-size: 24px; font-weight: 700; }}
 QLabel.statValue    {{ font-size: 16px; font-weight: 600; }}
 QLabel.statLabel    {{ font-size: 11px; font-weight: 600;
@@ -274,7 +290,7 @@ QLineEdit, QComboBox, QPlainTextEdit, QTextEdit {{
 QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus, QTextEdit:focus {{
     border-color: {c['accent']};
 }}
-QPlainTextEdit, QTextEdit {{ font-family: "Menlo", "Consolas", "Cascadia Mono", monospace; font-size: 12.5px; }}
+QPlainTextEdit, QTextEdit {{ font-family: {_MONO_FONTS}; font-size: 12.5px; }}
 QComboBox::drop-down {{
     subcontrol-origin: padding; subcontrol-position: top right;
     width: 22px; border: none;
@@ -348,7 +364,7 @@ QScrollArea > QWidget > QWidget {{ background: {c['window']}; }}
 QPlainTextEdit#log {{
     background: {c['log_bg']}; color: {c['log_fg']};
     border: 1px solid {c['border']}; border-radius: 10px;
-    font-family: "Menlo", "Consolas", "Cascadia Mono", monospace; font-size: 12px;
+    font-family: {_MONO_FONTS}; font-size: 12px;
     padding: 10px 12px;
 }}
 QTextEdit#result {{
@@ -2287,11 +2303,15 @@ def _resource_path(relative: str) -> str:
 
 
 def _find_app_icon() -> str:
-    """Pick the best icon file for QApplication.setWindowIcon. Windows
-    prefers .ico (multi-resolution); macOS/Linux prefer .png. We try .ico
-    first on Windows to ensure the taskbar uses the correct resolution."""
-    candidates = (("icon.ico", "icon.png") if sys.platform == "win32"
-                  else ("icon.png", "icon.ico"))
+    """Pick the best icon file for QApplication.setWindowIcon.
+    macOS bundle ships ChainProxy.icns inside Resources/; the dev tree has
+    icon.png at repo root. Windows uses icon.ico (multi-resolution)."""
+    if sys.platform == "darwin":
+        candidates = ("ChainProxy.icns", "icon.png", "icon.ico")
+    elif sys.platform == "win32":
+        candidates = ("icon.ico", "icon.png")
+    else:
+        candidates = ("icon.png", "icon.ico")
     for name in candidates:
         p = _resource_path(name)
         if os.path.exists(p):
