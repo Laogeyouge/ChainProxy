@@ -58,14 +58,31 @@
 
 1. 去 [Releases](../../releases) 下载最新版 `ChainProxy-x.y.z.dmg`
 2. 双击挂载，把 ChainProxy.app 拖到 Applications
-3. 装运行时依赖：
+3. 装运行时依赖（**两个都要**：mihomo 是代理内核，PyQt6 是 GUI）：
    ```bash
-   brew install mihomo
-   pip3 install PyQt6
+   brew install mihomo python   # python 没装过的话顺手装上
+   pip3 install --break-system-packages PyQt6
    ```
-4. Spotlight 搜 ChainProxy 打开。第一次启动如果 Gatekeeper 拦住，在 Finder 里右键 → 打开。
+4. **首次启动**：在 Finder 里**右键 ChainProxy.app → 打开**（双击会被 Gatekeeper 拦——dmg 没做苹果代码签名，所以新 App 都得这一步。之后从 Spotlight / Dock 就能直接开）
 
 需求：macOS 11 (Big Sur) 或更新，Python 3.9+。
+
+#### 装 PyQt6 时报 "externally-managed-environment"？
+
+新版 Homebrew Python 默认不让 `pip3 install` 直接装到全局，三选一：
+
+```bash
+# 方法 A（最简单，README 上面的命令就是这个）：加 --break-system-packages
+pip3 install --break-system-packages PyQt6
+
+# 方法 B：用 pipx（每个包隔离的 venv）
+brew install pipx && pipx install PyQt6
+
+# 方法 C：用 conda
+conda install -c conda-forge pyqt
+```
+
+ChainProxy 的启动器会从 PATH / Homebrew / Miniconda / Anaconda / pyenv / Python.org installer 里**自动挑一个装了 PyQt6 的 Python**——只要任意一个 Python 装了 PyQt6 就能启动。
 
 ### 从源码运行 / 自己打包
 
@@ -74,7 +91,7 @@
 git clone https://github.com/Laogeyouge/ChainProxy.git
 cd ChainProxy
 brew install mihomo
-pip3 install PyQt6
+pip3 install --break-system-packages PyQt6
 
 python3 chainproxy_qt.py            # 直接跑
 bash scripts/build.sh               # 打包到 ChainProxy.app
