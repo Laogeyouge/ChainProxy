@@ -22,6 +22,7 @@ scripts/mihomo.exe
 # The app bundle has source stamped in by scripts/build.sh — don't commit those copies.
 ChainProxy.app/Contents/Resources/chainproxy_qt.py
 ChainProxy.app/Contents/Resources/chainproxy_core.py
+ChainProxy.app/Contents/Resources/core/
 
 # macOS / Python cruft
 .DS_Store
