@@ -26,6 +26,7 @@ ChainProxy.app/Contents/Resources/core/
 
 # macOS / Python cruft
 .DS_Store
+.metadata_never_index
 __pycache__/
 *.pyc
 *.pyo
