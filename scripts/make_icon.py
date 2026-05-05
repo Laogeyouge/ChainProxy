@@ -13,60 +13,62 @@ import tempfile
 SIZE = 1024
 BG_TOP = (51, 149, 255)
 BG_BOT = (0, 102, 204)
-RADIUS = int(SIZE * 0.225)
 WHITE = (255, 255, 255)
 INNER = BG_TOP
+# Apple icon convention (macOS Big Sur+): the rounded square only fills
+# ~80% of the canvas; the remaining ~10% per side is transparent padding.
+# Without this, our icon visually outsizes every native app in the Dock.
+INNER_FRAC = 0.824
+RADIUS_FRAC = 0.225  # of the inner content size, not the canvas
 
-def make_master(size=SIZE):
+def _make_inner(inner: int) -> Image.Image:
+    """Draw the rounded square with chain glyph at `inner` × `inner` pixels."""
+    radius = int(inner * RADIUS_FRAC)
+
     # Vertical gradient
-    grad = Image.new('RGB', (1, size))
-    for y in range(size):
-        t = y / (size - 1)
+    grad = Image.new('RGB', (1, inner))
+    for y in range(inner):
+        t = y / (inner - 1)
         r = int(BG_TOP[0] + (BG_BOT[0] - BG_TOP[0]) * t)
         g = int(BG_TOP[1] + (BG_BOT[1] - BG_TOP[1]) * t)
         b = int(BG_TOP[2] + (BG_BOT[2] - BG_TOP[2]) * t)
         grad.putpixel((0, y), (r, g, b))
-    grad = grad.resize((size, size))
+    grad = grad.resize((inner, inner))
 
-    # Rounded mask
-    mask = Image.new('L', (size, size), 0)
+    mask = Image.new('L', (inner, inner), 0)
     ImageDraw.Draw(mask).rounded_rectangle(
-        [0, 0, size, size], radius=RADIUS, fill=255)
+        [0, 0, inner, inner], radius=radius, fill=255)
 
-    img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    img = Image.new('RGBA', (inner, inner), (0, 0, 0, 0))
     img.paste(grad, (0, 0), mask)
 
     # Soft top highlight for depth
-    hl = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    hl = Image.new('RGBA', (inner, inner), (0, 0, 0, 0))
     ImageDraw.Draw(hl).rounded_rectangle(
-        [0, 0, size, int(size * 0.35)],
-        radius=RADIUS, fill=(255, 255, 255, 32))
-    hl = hl.filter(ImageFilter.GaussianBlur(radius=size * 0.05))
-    hl_clipped = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        [0, 0, inner, int(inner * 0.35)],
+        radius=radius, fill=(255, 255, 255, 32))
+    hl = hl.filter(ImageFilter.GaussianBlur(radius=inner * 0.05))
+    hl_clipped = Image.new('RGBA', (inner, inner), (0, 0, 0, 0))
     hl_clipped.paste(hl, (0, 0), mask)
     img = Image.alpha_composite(img, hl_clipped)
 
     # Chain glyph
-    glyph = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    glyph = Image.new('RGBA', (inner, inner), (0, 0, 0, 0))
     g = ImageDraw.Draw(glyph)
-    cy = int(size * 0.50)
-    node_r = int(size * 0.105)
-    line_w = int(size * 0.045)
-    inner_r = int(node_r * 0.28)        # smaller, port-like dot
-    xs = [int(size * 0.235), int(size * 0.50), int(size * 0.765)]
+    cy = int(inner * 0.50)
+    node_r = int(inner * 0.105)
+    line_w = int(inner * 0.045)
+    inner_r = int(node_r * 0.28)
+    xs = [int(inner * 0.235), int(inner * 0.50), int(inner * 0.765)]
 
-    # Connecting lines (clean, no chevrons)
     for x1, x2 in zip(xs[:-1], xs[1:]):
-        # Avoid drawing inside the white circles to keep edges crisp
         g.line([(x1 + node_r, cy), (x2 - node_r, cy)],
                 fill=WHITE, width=line_w)
 
-    # Arrow tail extending right of the last node, ending in arrowhead
     tail_x0 = xs[-1] + node_r
-    tail_x1 = int(size * 0.92)
+    tail_x1 = int(inner * 0.92)
     g.line([(tail_x0, cy), (tail_x1 - int(node_r * 0.55), cy)],
             fill=WHITE, width=line_w)
-    # Arrowhead
     ah = int(node_r * 0.55)
     g.polygon(
         [(tail_x1, cy),
@@ -76,15 +78,25 @@ def make_master(size=SIZE):
         fill=WHITE,
     )
 
-    # Solid white circles with small inner port dot
     for x in xs:
         g.ellipse([x - node_r, cy - node_r, x + node_r, cy + node_r],
                   fill=WHITE)
         g.ellipse([x - inner_r, cy - inner_r, x + inner_r, cy + inner_r],
                   fill=INNER)
 
-    img = Image.alpha_composite(img, glyph)
-    return img
+    return Image.alpha_composite(img, glyph)
+
+
+def make_master(size=SIZE):
+    """Full canvas with the rounded square inset to ~82.4% per Apple's
+    macOS icon template — without this padding, the Dock renders our icon
+    visually larger than every native app."""
+    inner_size = int(size * INNER_FRAC)
+    offset = (size - inner_size) // 2
+    canvas = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    canvas.paste(_make_inner(inner_size), (offset, offset),
+                 _make_inner(inner_size))
+    return canvas
 
 def main():
     repo_root = Path(__file__).resolve().parent.parent
