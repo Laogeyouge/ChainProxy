@@ -2123,15 +2123,43 @@ class MainWindow(QMainWindow):
 
     def _cleanup_orphan_proxy_state(self):
         """Windows-only: a previous GUI session crashed/was killed while it
-        owned the system proxy. The snapshot file is the marker. Restore the
-        original registry values now so the user has working internet."""
+        owned the system proxy. The snapshot file is the marker.
+
+        Two cases:
+          1. Registry STILL points at our 127.0.0.1:<port> → restore the
+             snapshot so the user has working internet again.
+          2. Registry has been changed by something else (third-party proxy
+             client, manual edit) since our crash → DON'T restore, the
+             snapshot is now stale and would clobber whatever is currently
+             working. Just drop the backup file so future enable/disable
+             cycles aren't confused by it.
+        """
         try:
             backup_path = core.SUPPORT_DIR / ".proxy_backup.json"
             if not backup_path.exists():
                 return
-            self.log("⚠ 检测到上次 GUI 异常退出时未还原系统代理，自动清理…")
-            ok, info = core.set_system_proxy(0, enable=False)
-            self.log(f"  系统代理状态：{info if ok else 'error: ' + info}")
+            # Decide whether we still own the registry by looking at our
+            # signature ProxyOverride string + a 127.0.0.1 server (don't pin
+            # to a specific port — user may have changed `local_port` between
+            # crash and restart).
+            cur = core._read_proxy_state()
+            registry_is_ours = (
+                str(cur.get("ProxyOverride", "")) == core._DEFAULT_BYPASS
+                and str(cur.get("ProxyServer", "")).startswith("127.0.0.1:")
+            )
+            if registry_is_ours:
+                self.log("⚠ 检测到上次 GUI 异常退出时未还原系统代理，自动清理…")
+                ok, info = core.set_system_proxy(0, enable=False)
+                self.log(f"  系统代理状态：{info if ok else 'error: ' + info}")
+            else:
+                # Someone else has taken over the registry — leave it alone,
+                # just drop our stale snapshot so we don't try to restore it
+                # over a third-party client's working settings later.
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
+                self.log("启动检查：检测到系统代理已被其他程序接管，跳过自动还原。")
         except Exception as e:
             self.log(f"启动清理失败：{e}")
 

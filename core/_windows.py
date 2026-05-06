@@ -232,20 +232,33 @@ def set_system_proxy(port, enable):
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PROXY_KEY, 0,
                             winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as k:
             if enable:
-                # 1. Snapshot the current state — but ONLY if we haven't
-                # already done so. Two consecutive enables shouldn't lose
-                # the user's real original config.
-                if not backup_path.exists():
+                # 1. Snapshot the current state. We take a fresh snapshot if
+                # one doesn't exist, OR if the existing snapshot is stale
+                # (a third party — Clash/V2Ray/manual edit — has taken over
+                # the registry since our previous crash, so the snapshot no
+                # longer represents the user's real "before-ChainProxy" state).
+                #
+                # Detection: our _DEFAULT_BYPASS string is distinctive enough
+                # that no other proxy client would write the exact same value.
+                # If the current ProxyOverride matches it, we're still in
+                # control — preserve the existing snapshot. Otherwise the
+                # registry has been modified since we last enabled, and the
+                # snapshot is stale.
+                want_str = f"127.0.0.1:{int(port)}"
+                cur = _read_proxy_state()
+                cur_is_ours = (
+                    str(cur.get("ProxyOverride", "")) == _DEFAULT_BYPASS
+                    and str(cur.get("ProxyServer", "")).startswith("127.0.0.1:")
+                )
+                if not backup_path.exists() or not cur_is_ours:
                     SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
-                    snapshot = _read_proxy_state()
                     backup_path.write_text(
-                        json.dumps(snapshot, ensure_ascii=False),
+                        json.dumps(cur, ensure_ascii=False),
                         encoding="utf-8",
                     )
                 # 2. Write our values
                 winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-                winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ,
-                                  f"127.0.0.1:{int(port)}")
+                winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, want_str)
                 winreg.SetValueEx(k, "ProxyOverride", 0, winreg.REG_SZ,
                                   _DEFAULT_BYPASS)
             else:
@@ -257,8 +270,20 @@ def set_system_proxy(port, enable):
                         winreg.SetValueEx(k, "ProxyEnable", 0,
                                           winreg.REG_DWORD,
                                           int(snap.get("ProxyEnable", 0)))
-                        winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ,
-                                          str(snap.get("ProxyServer", "")))
+                        # If the original ProxyServer was empty, DELETE the
+                        # value rather than writing "". Same logic as the
+                        # force-clear path: a literal empty string confuses
+                        # third-party clients that only check ProxyEnable
+                        # before rewriting ProxyServer.
+                        srv = str(snap.get("ProxyServer", ""))
+                        if srv:
+                            winreg.SetValueEx(k, "ProxyServer", 0,
+                                              winreg.REG_SZ, srv)
+                        else:
+                            try:
+                                winreg.DeleteValue(k, "ProxyServer")
+                            except FileNotFoundError:
+                                pass
                         # ProxyOverride may not have existed originally
                         ov = snap.get("ProxyOverride", "")
                         if ov:
@@ -746,4 +771,5 @@ __all__ = [
     "set_system_proxy", "panic_recover", "MihomoRunner",
     "acquire_single_instance_lock", "activate_existing_window",
     "is_elevated", "relaunch_elevated",
+    "_read_proxy_state", "_DEFAULT_BYPASS",
 ]
