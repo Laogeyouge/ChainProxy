@@ -327,6 +327,16 @@ def build_mihomo_yaml(cfg, ruleset_dir: Path):
     if rule_providers:
         doc["rule-providers"] = rule_providers
     if cfg.get("tun_mode"):
+        # store-fake-ip persists the fakeip↔domain table to mihomo's cache.db
+        # so the same domain gets the same fakeip across mihomo restarts.
+        # Why: macOS system DNS resolver caches our fakeip answers. Without
+        # persistence, every mihomo restart (rule edit auto-restart, node
+        # change, manual restart) reshuffles the pool, leaving the system
+        # cache pointing at fakeips the new mihomo doesn't recognize. Symptom:
+        # "claude.ai works, then suddenly stops; netflix keeps working because
+        # it's on a long-lived QUIC connection." Fixed by making the mapping
+        # stable across restarts.
+        doc["profile"] = {"store-fake-ip": True}
         doc["dns"] = {
             "enable": True,
             "listen": "127.0.0.1:0",

@@ -37,11 +37,11 @@ MIHOMO_BIN_CANDIDATES = [
 # ---------- helper-script for TUN privilege ----------
 HELPER_PATH = "/usr/local/bin/chainproxy-helper.sh"
 SUDOERS_PATH = "/etc/sudoers.d/chainproxy"
-HELPER_VERSION = "4"
+HELPER_VERSION = "5"
 HELPER_SCRIPT = r"""#!/bin/bash
-# version: 4
+# version: 5
 # ChainProxy mihomo helper. Managed by ChainProxy.app — DO NOT EDIT.
-# Args: <runtime-dir> <action: start|stop|status|recover> [yaml-path]
+# Args: <runtime-dir> <action: start|stop|status|recover|flush-dns> [yaml-path]
 set -e
 RUNTIME="$1"
 ACTION="$2"
@@ -71,6 +71,20 @@ cleanup_utun() {
   done
 }
 
+# Why: macOS resolver caches our fakeip answers (claude.ai → 198.18.0.x).
+# That cache outlives mihomo. Whenever mihomo's fakeip↔domain table changes
+# or mihomo exits, the cached fakeips become stale — apps connect to a
+# number nobody recognises and routing breaks (most visibly on Claude /
+# short-lived TLS, while Netflix-style long-lived QUIC keeps working).
+# Flushing on every lifecycle event guarantees the system never holds a
+# fakeip that mihomo can't resolve. dscacheutil works for any user;
+# killall -HUP mDNSResponder requires root, which is why this lives in
+# the helper.
+flush_dns() {
+  /usr/bin/dscacheutil -flushcache 2>/dev/null || true
+  /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true
+}
+
 kill_orphans() {
   pkill -TERM -f "mihomo -d $RUNTIME" 2>/dev/null || true
   for i in $(seq 1 15); do
@@ -85,6 +99,7 @@ case "$ACTION" in
     kill_orphans
     cleanup_routes
     cleanup_utun
+    flush_dns
     rm -f "$PIDFILE"
     nohup "$MIHOMO" -d "$RUNTIME" -f "$YAML" >> "$LOG" 2>&1 &
     pid=$!
@@ -112,7 +127,8 @@ case "$ACTION" in
     kill_orphans
     cleanup_routes
     cleanup_utun
-    echo "stopped + routes cleaned"
+    flush_dns
+    echo "stopped + routes cleaned + dns flushed"
     ;;
   recover)
     if [ -f "$PIDFILE" ]; then
@@ -124,7 +140,12 @@ case "$ACTION" in
     pkill -KILL -f "mihomo -d $RUNTIME" 2>/dev/null || true
     cleanup_routes
     cleanup_utun
+    flush_dns
     echo "recovered"
+    ;;
+  flush-dns)
+    flush_dns
+    echo "dns flushed"
     ;;
   status)
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
@@ -136,7 +157,7 @@ case "$ACTION" in
     fi
     ;;
   *)
-    echo "usage: $0 RUNTIME start|stop|status|recover [YAML]" >&2
+    echo "usage: $0 RUNTIME start|stop|status|recover|flush-dns [YAML]" >&2
     exit 2
     ;;
 esac
@@ -306,6 +327,22 @@ def set_system_proxy(port, enable):
     return True, svc
 
 
+def _flush_dns_cache_unprivileged(log_cb):
+    """Flush the user-visible portion of macOS DNS cache without sudo.
+    `dscacheutil -flushcache` works for any user; the deeper mDNSResponder
+    HUP needs root and lives in the helper. Worth running anyway because
+    even a partial flush often clears the stale claude.ai → 198.18.0.x
+    entries that confuse other proxy clients."""
+    try:
+        subprocess.run(
+            ["/usr/bin/dscacheutil", "-flushcache"],
+            capture_output=True, text=True, timeout=5,
+        )
+        log_cb("  DNS 缓存已 flush（dscacheutil）")
+    except Exception as e:
+        log_cb(f"  dscacheutil flush 失败: {e}")
+
+
 def panic_recover(log_cb):
     """Best-effort cleanup."""
     log_cb("=== 网络急救 ===")
@@ -320,8 +357,10 @@ def panic_recover(log_cb):
             log_cb(f"  helper recover: {(r.stdout or r.stderr).strip()}")
         except Exception as e:
             log_cb(f"  helper recover 失败: {e}")
+            _flush_dns_cache_unprivileged(log_cb)
     else:
         log_cb("  未安装 sudo helper，跳过 TUN 路由清理")
+        _flush_dns_cache_unprivileged(log_cb)
     log_cb("==================")
 
 
