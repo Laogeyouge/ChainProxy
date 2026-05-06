@@ -37,9 +37,9 @@ MIHOMO_BIN_CANDIDATES = [
 # ---------- helper-script for TUN privilege ----------
 HELPER_PATH = "/usr/local/bin/chainproxy-helper.sh"
 SUDOERS_PATH = "/etc/sudoers.d/chainproxy"
-HELPER_VERSION = "5"
+HELPER_VERSION = "6"
 HELPER_SCRIPT = r"""#!/bin/bash
-# version: 5
+# version: 6
 # ChainProxy mihomo helper. Managed by ChainProxy.app — DO NOT EDIT.
 # Args: <runtime-dir> <action: start|stop|status|recover|flush-dns> [yaml-path]
 set -e
@@ -71,6 +71,33 @@ cleanup_utun() {
   done
 }
 
+# Why: another local mihomo-based client (Clash/ClashX/Stash/Mihomo Party)
+# defaults to the same fakeip gateway 198.18.0.1 and installs the same
+# split-half routes. If we naively `start` while it owns those routes,
+# `cleanup_routes` deletes ITS routes (breaking it briefly), then mihomo
+# auto-route reinstalls them via OUR utun. The other client's monitor sees
+# its routes vanish and reinstalls via ITS utun. Two daemons fight, route
+# table flips every few seconds, every dial breaks.
+#
+# Detection: this runs AFTER cleanup_routes + cleanup_utun. If 198.18.0.1
+# is still (or already again) routed to some utun, that route was put back
+# by a live foreign daemon — we just deleted ours. We sleep briefly so a
+# foreign daemon's monitor has time to re-install before we sample.
+preflight_check() {
+  sleep 1
+  iface=$(/usr/sbin/netstat -rn -f inet 2>/dev/null \
+            | awk '$1=="198.18.0.1" && $2=="198.18.0.1" {print $NF; exit}')
+  [ -z "$iface" ] && return 0
+  case "$iface" in
+    utun*)
+      echo "ERROR: 198.18.0.1 is already in use by another proxy on $iface." >&2
+      echo "Close that proxy client first (Clash/ClashX/Stash/Mihomo Party等)，" >&2
+      echo "再启动 ChainProxy。两个 TUN 共用同一 fakeip 网关会互相破坏路由。" >&2
+      exit 3
+      ;;
+  esac
+}
+
 # Why: macOS resolver caches our fakeip answers (claude.ai → 198.18.0.x).
 # That cache outlives mihomo. Whenever mihomo's fakeip↔domain table changes
 # or mihomo exits, the cached fakeips become stale — apps connect to a
@@ -100,6 +127,7 @@ case "$ACTION" in
     cleanup_routes
     cleanup_utun
     flush_dns
+    preflight_check
     rm -f "$PIDFILE"
     nohup "$MIHOMO" -d "$RUNTIME" -f "$YAML" >> "$LOG" 2>&1 &
     pid=$!
@@ -455,6 +483,10 @@ class MihomoRunner:
         )
         if result.returncode != 0:
             err = (result.stderr or "").strip()
+            # Exit 3 = preflight detected another proxy owning 198.18.0.1.
+            # Surface the helper's message verbatim — it already explains why.
+            if result.returncode == 3:
+                raise RuntimeError(err or "另一个代理客户端正占用 TUN 网关 198.18.0.1")
             if "password is required" in err.lower() or "a terminal" in err.lower():
                 self.log_cb("免密规则缺失，重新安装…")
                 install_helper()

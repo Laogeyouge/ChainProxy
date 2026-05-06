@@ -1784,6 +1784,10 @@ class MainWindow(QMainWindow):
         self.invoke_signal.connect(lambda fn: fn())
         self.log_signal.connect(self._on_log_signal)
 
+        self._mihomo_started_at = 0.0
+        self._watchdog_failures = 0
+        self._watchdog_last_restart = 0.0
+
         self._build()
         self.refresh_theme()
         self.runner.attach_existing(self.log)
@@ -1794,6 +1798,10 @@ class MainWindow(QMainWindow):
         # present AND no orphan mihomo was adopted, restore the snapshot now.
         if sys.platform == "win32" and not self.runner.is_running():
             self._cleanup_orphan_proxy_state()
+        if self.runner.is_running():
+            # Adopted orphan: it's been alive for unknown time; skip warm-up
+            # so the watchdog can act immediately if it's already wedged.
+            self._mihomo_started_at = time.time() - 120
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -1804,6 +1812,15 @@ class MainWindow(QMainWindow):
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
         self._restart_timer.timeout.connect(self._do_debounced_restart)
+
+        # Outbound health watchdog: catches the "process alive but every dial
+        # times out" failure mode (sleep/wake, route conflict with another
+        # local TUN proxy, zombie utun). 30s cadence × 2 strikes ≈ 1 minute
+        # before auto-restart, which beats the user reaching for 网络急救
+        # (which only stops, doesn't restart) and then a reboot.
+        self._watchdog_timer = QTimer(self)
+        self._watchdog_timer.timeout.connect(self._watchdog_tick)
+        self._watchdog_timer.start(30000)
 
         try:
             app.styleHints().colorSchemeChanged.connect(
@@ -2022,6 +2039,73 @@ class MainWindow(QMainWindow):
         self.stop(cancel_pending_restart=False)
         QTimer.singleShot(500, lambda: self.start(silent=True))
 
+    def _watchdog_tick(self):
+        """Periodic outbound-connectivity check. If mihomo is alive but its
+        DIAL path is broken (e.g. all DIRECT dials timing out), restart it.
+
+        is_running() only checks the process; mihomo can be stuck with every
+        dial returning i/o timeout / connection refused while still answering
+        its controller. That's the state where 网络急救 helps the user (it
+        kills mihomo + clears routes) but doesn't recover them, and where
+        the user used to have to reboot. The watchdog short-circuits both."""
+        if not self.runner.is_running():
+            self._watchdog_failures = 0
+            return
+        started = self._mihomo_started_at
+        if not started or (time.time() - started) < 60:
+            # Warm-up: rule sets, GeoIP DB, fakeip cache loading from disk.
+            return
+        if self._probe_outbound():
+            if self._watchdog_failures > 0:
+                self.log("✓ 网络出站已恢复")
+            self._watchdog_failures = 0
+            return
+        self._watchdog_failures += 1
+        self.log(f"⚠ 出站健康探测失败 ({self._watchdog_failures}/2)")
+        if self._watchdog_failures < 2:
+            return
+        now = time.time()
+        # If we just restarted and outbound is STILL broken, the issue isn't
+        # mihomo state — it's upstream (WiFi down, ISP, first-hop client off).
+        # Don't loop-restart; surface to the user.
+        if now - self._watchdog_last_restart < 180:
+            self.toast("网络持续异常，请检查 WiFi/上游代理", error=True)
+            return
+        self._watchdog_last_restart = now
+        self._watchdog_failures = 0
+        self.log("⚠ mihomo 出站持续不通，自动重启…")
+        self.toast("网络异常，自动重启 mihomo")
+        self.stop(cancel_pending_restart=False)
+        QTimer.singleShot(500, lambda: self.start(silent=True))
+
+    def _probe_outbound(self) -> bool:
+        """HEAD `http://www.baidu.com/` through the local mixed-port. We
+        probe THROUGH mihomo (not direct) so a TUN loop / route conflict /
+        DNS upstream death registers as failure. Any HTTP response counts —
+        we just need to know the dial-and-talk path is alive."""
+        import http.client
+        try:
+            port = int(self.cfg.get("local_port", 7890))
+        except (TypeError, ValueError):
+            return True  # don't false-alarm on bad config
+        conn = None
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=4)
+            conn.request("HEAD", "http://www.baidu.com/", headers={
+                "Host": "www.baidu.com",
+                "User-Agent": "ChainProxy-watchdog/1.0",
+            })
+            resp = conn.getresponse()
+            return 100 <= resp.status < 600
+        except Exception:
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
         if hasattr(self, "_toast") and self._toast.isVisible():
@@ -2119,6 +2203,8 @@ class MainWindow(QMainWindow):
             self.toggle_system_proxy(True)
         elif use_sudo:
             self.log("TUN 模式已启用，无需设系统代理")
+        self._mihomo_started_at = time.time()
+        self._watchdog_failures = 0
         self._tick()
 
     def _cleanup_orphan_proxy_state(self):
@@ -2192,6 +2278,8 @@ class MainWindow(QMainWindow):
             self.log(f"stop error: {e}")
         if self._we_set_proxy:
             self.toggle_system_proxy(False)
+        self._mihomo_started_at = 0.0
+        self._watchdog_failures = 0
         self._tick()
 
     def toggle_system_proxy(self, on):
@@ -2214,16 +2302,27 @@ class MainWindow(QMainWindow):
 
     def panic_recover(self):
         if sys.platform == "darwin":
-            prompt = "执行：清系统代理 + 杀残留 mihomo + 删 TUN 路由 + 关 utun。\n\n继续？"
+            prompt = ("执行：清系统代理 + 杀残留 mihomo + 删 TUN 路由 + 关 utun，"
+                      "然后用全新状态重启 mihomo。\n\n继续？")
         else:
-            prompt = "执行：清系统代理 + 杀残留 mihomo.exe（WinTun 由 mihomo 自行清理）。\n\n继续？"
+            prompt = ("执行：清系统代理 + 杀残留 mihomo.exe，然后用全新状态重启。\n\n继续？")
         if QMessageBox.question(self, "网络急救", prompt) != QMessageBox.StandardButton.Yes:
             return
+        # If mihomo was running before rescue, restart it after cleanup so
+        # the user lands back in a working proxy state (fresh fakeip table,
+        # fresh routes, fresh DNS) — not a "rescued but proxy off" limbo.
+        # Without this, prior users found 网络急救 "useless" because it left
+        # them with no proxy AND any other-process state still poisoned.
+        was_running = self.runner.is_running()
         def worker():
             try: self.runner.stop()
             except Exception: pass
             core.panic_recover(self.log)
-            self.qt_invoke(lambda: self.toast("已恢复网络"))
+            if was_running:
+                self.qt_invoke(lambda: self.toast("清理完成，重启 mihomo…"))
+                self.qt_invoke(lambda: self.start(silent=True))
+            else:
+                self.qt_invoke(lambda: self.toast("已恢复网络"))
         threading.Thread(target=worker, daemon=True).start()
 
     # ── system tray ───────────────────────────────────────────────────────

@@ -337,12 +337,30 @@ def build_mihomo_yaml(cfg, ruleset_dir: Path):
         # it's on a long-lived QUIC connection." Fixed by making the mapping
         # stable across restarts.
         doc["profile"] = {"store-fake-ip": True}
+        # default-nameserver bootstraps any hostname-form upstream out-of-band
+        # of fakeip — defensive even though our `nameserver` entries are IPs
+        # today, because user-edited configs may add hostnames later.
+        # fake-ip-filter excludes domains that must resolve to real IPs:
+        # mDNS/.local, reverse-DNS, captive-portal probes (msftconnecttest /
+        # captive.apple.com), and a few QQ login quirks. Without these, fakeip
+        # answers break local-network discovery and macOS captive detection.
         doc["dns"] = {
             "enable": True,
             "listen": "127.0.0.1:0",
             "ipv6": False,
             "enhanced-mode": "fake-ip",
+            "default-nameserver": ["223.5.5.5", "119.29.29.29"],
             "nameserver": ["119.29.29.29", "223.5.5.5"],
+            "fake-ip-filter": [
+                "*.lan",
+                "*.local",
+                "*.in-addr.arpa",
+                "*.ip6.arpa",
+                "+.msftconnecttest.com",
+                "+.msftncsi.com",
+                "captive.apple.com",
+                "localhost.ptlogin2.qq.com",
+            ],
         }
         doc["tun"] = {
             "enable": True,
