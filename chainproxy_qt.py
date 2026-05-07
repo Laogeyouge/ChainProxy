@@ -2073,16 +2073,34 @@ class MainWindow(QMainWindow):
                 and self.runner.is_running()
                 and self.cfg.get("tun_mode")):
             self._check_for_foreign_tun()
-        # 30s cadence; >90s gap = system slept. macOS's PFROUTE sometimes
-        # doesn't fire route-change events for the wake transition, so
-        # mihomo's auto-detect stays bound to pre-sleep socket state and
-        # every dial fails. Force a clean restart 8s after wake (give Wi-Fi
-        # time to re-associate and DHCP to renew before mihomo binds again).
-        if last_tick > 0 and (now - last_tick) > 90 and self.runner.is_running():
-            gap = int(now - last_tick)
-            self.log(f"⌁ 检测到系统休眠/唤醒（间隔 {gap}s），8s 后重启 mihomo 刷新出站状态")
-            QTimer.singleShot(8000, self._post_wake_recover)
-            return
+        # 30s tick cadence; jitter is sub-second. Tier the response by gap:
+        #   <35s : normal tick, fall through to probe
+        #   35-90s : brief sleep (clamshell flicker, lid-close <60s). The
+        #     OS-level interface usually survives but mihomo's connection
+        #     table holds dead-on-the-server-side TCP connections — apps
+        #     reusing them sit on retransmits for 10-30s before reconnecting.
+        #     Symptom: "WeChat sends slow for a minute after wake."
+        #     Fix: DELETE /connections on mihomo controller, forces apps
+        #     to drop stale FDs and dial fresh. No process restart, no
+        #     Wi-Fi bounce, no perceptible interruption.
+        #   >90s : long sleep, mihomo's auto-detect-interface may be stuck
+        #     on pre-sleep socket state. Schedule a full restart at +8s
+        #     so Wi-Fi can re-associate before mihomo binds again.
+        if last_tick > 0 and self.runner.is_running():
+            gap = now - last_tick
+            if gap > 90:
+                self.log(f"⌁ 检测到系统长时间休眠（间隔 {gap:.0f}s），"
+                         f"8s 后重启 mihomo 刷新出站状态")
+                QTimer.singleShot(8000, self._post_wake_recover)
+                return
+            if gap > 35:
+                self.log(f"⌁ 检测到系统短暂休眠（间隔 {gap:.0f}s），"
+                         f"清理 mihomo 陈旧连接（apps 自动重连）")
+                threading.Thread(target=self._evict_connections_worker,
+                                 daemon=True).start()
+                # Fall through to probe — eviction is fire-and-forget; if
+                # something is also broken at the dial level we still want
+                # to detect it.
 
         if not self.runner.is_running():
             self._watchdog_failures = 0
@@ -2169,6 +2187,32 @@ class MainWindow(QMainWindow):
         self._intentional_stop = True
         self.stop(cancel_pending_restart=False)
         QTimer.singleShot(500, lambda: self.start(silent=True))
+
+    def _evict_connections_worker(self):
+        """Off-thread: ask mihomo to close all open connections via its
+        REST controller. Used after sleep/wake to force apps reusing
+        pre-sleep TCP connections (whose remote end has long since timed
+        out) to dial fresh. The DELETE returns immediately; mihomo closes
+        each conn server-side, the apps see EOF/RST on their next read,
+        retry, and reconnect via mihomo's outbound — all within a second.
+        Without this, WeChat / Slack / browsers sit on dead sockets for
+        10-30s before TCP-keepalive or app-level retry kicks them."""
+        import urllib.request, urllib.error
+        try:
+            port = int(self.cfg.get("controller_port", 9999))
+            secret = self.cfg.get("controller_secret", "")
+        except (TypeError, ValueError):
+            return
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/connections", method="DELETE")
+            if secret:
+                req.add_header("Authorization", f"Bearer {secret}")
+            with urllib.request.urlopen(req, timeout=3) as r:
+                r.read()
+            self.qt_invoke(lambda: self.log("✓ 已清理 mihomo 陈旧连接"))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            self.qt_invoke(lambda: self.log(f"⚠ 清理陈旧连接失败: {e}"))
 
     def _check_for_foreign_tun(self):
         """If the kernel routes 198.18.0.1 to a utun other than ours, another
