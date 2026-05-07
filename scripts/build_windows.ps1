@@ -18,12 +18,26 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
 
+# PowerShell 5.1 wraps any stderr line from a native exe as a NativeCommandError
+# whenever the host is capturing stderr (CI, redirected runs, IDE tasks).
+# Combined with $ErrorActionPreference = "Stop" above, that aborts the script
+# on tools that legitimately write progress to stderr — PyInstaller's "INFO"
+# stream is the canonical example. Run those commands with EAP scoped to
+# "Continue" and rely on $LASTEXITCODE for real failure detection.
+function Invoke-Native {
+    param([scriptblock]$Block)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $Block } finally { $ErrorActionPreference = $prev }
+}
+
 $REPO    = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $SCRIPTS = Join-Path $REPO "scripts"
 Set-Location $REPO
 
 Write-Host "==[1/5]== Regenerating icon.ico" -ForegroundColor Cyan
-py scripts\make_icon_windows.py
+Invoke-Native { py scripts\make_icon_windows.py }
+if ($LASTEXITCODE -ne 0) { throw "icon generation failed (exit $LASTEXITCODE)" }
 
 Write-Host ""
 Write-Host "==[2/5]== Ensuring bundled mihomo.exe is present" -ForegroundColor Cyan
@@ -54,7 +68,7 @@ if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
 
 Write-Host ""
 Write-Host "==[4/5]== Running PyInstaller" -ForegroundColor Cyan
-py -m PyInstaller --noconfirm --clean scripts\chainproxy_windows.spec
+Invoke-Native { py -m PyInstaller --noconfirm --clean scripts\chainproxy_windows.spec }
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed (exit $LASTEXITCODE)" }
 
 $exePath = Join-Path $REPO "dist\ChainProxy\ChainProxy.exe"
@@ -113,7 +127,7 @@ if (-not (Test-Path $chsLang)) {
 }
 
 Write-Host "  using $iscc"
-& $iscc "$SCRIPTS\installer.iss"
+Invoke-Native { & $iscc "$SCRIPTS\installer.iss" }
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed (exit $LASTEXITCODE)" }
 
 $installer = Get-ChildItem "$REPO\dist\ChainProxy-Setup-*.exe" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
