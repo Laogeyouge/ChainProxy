@@ -37,9 +37,9 @@ MIHOMO_BIN_CANDIDATES = [
 # ---------- helper-script for TUN privilege ----------
 HELPER_PATH = "/usr/local/bin/chainproxy-helper.sh"
 SUDOERS_PATH = "/etc/sudoers.d/chainproxy"
-HELPER_VERSION = "7"
+HELPER_VERSION = "8"
 HELPER_SCRIPT = r"""#!/bin/bash
-# version: 7
+# version: 8
 # ChainProxy mihomo helper. Managed by ChainProxy.app — DO NOT EDIT.
 # Args: <runtime-dir> <action: start|stop|status|recover|flush-dns|bounce-iface> [yaml-path]
 set -e
@@ -142,6 +142,21 @@ kill_orphans() {
   pkill -KILL -f "mihomo -d $RUNTIME" 2>/dev/null || true
 }
 
+# Why: nohup mihomo … >> "$LOG" appends forever; the file never gets rotated
+# in the helper's spawn path, and after months of use it grows into the
+# gigabytes (one bug-report had a 4GB mihomo.log on a developer machine).
+# Single-rotation is the simplest fix that doesn't add operational surface:
+# rename to .1 once over 10MB, never compress, never multi-generation.
+# /usr/bin/stat is BSD on macOS, -f%z = file size in bytes.
+rotate_log_if_large() {
+  if [ -f "$LOG" ]; then
+    sz=$(/usr/bin/stat -f%z "$LOG" 2>/dev/null || echo 0)
+    if [ "$sz" -gt 10485760 ]; then
+      mv -f "$LOG" "$LOG.1" 2>/dev/null || true
+    fi
+  fi
+}
+
 case "$ACTION" in
   start)
     kill_orphans
@@ -149,6 +164,7 @@ case "$ACTION" in
     cleanup_utun
     flush_dns
     preflight_check
+    rotate_log_if_large
     rm -f "$PIDFILE"
     nohup "$MIHOMO" -d "$RUNTIME" -f "$YAML" >> "$LOG" 2>&1 &
     pid=$!
@@ -163,6 +179,14 @@ case "$ACTION" in
     echo "started pid=$pid"
     ;;
   stop)
+    # Why flush_dns first: macOS's resolver caches our fakeip answers
+    # (claude.ai → 198.18.0.x). If we kill mihomo first, then flush, there's
+    # a 200ms-1s window where apps re-resolve, hit cache, get a fakeip whose
+    # listener is gone → "connection refused" surfaces to the user. Flushing
+    # BEFORE kill ensures the next resolve goes to a real upstream resolver
+    # (e.g. 119.29.29.29) which returns the real IP. Second flush after kill
+    # purges any entry that snuck in during the kill window.
+    flush_dns
     if [ -f "$PIDFILE" ]; then
       pid=$(cat "$PIDFILE")
       kill -TERM "$pid" 2>/dev/null || true
@@ -180,6 +204,7 @@ case "$ACTION" in
     echo "stopped + routes cleaned + dns flushed"
     ;;
   recover)
+    flush_dns
     if [ -f "$PIDFILE" ]; then
       pid=$(cat "$PIDFILE")
       kill -KILL "$pid" 2>/dev/null || true
@@ -259,6 +284,12 @@ def load_config():
 
 def save_config(cfg):
     _common.save_config(cfg, CONFIG_PATH, SUPPORT_DIR)
+
+
+def atomic_write_text(path, content, encoding="utf-8"):
+    """Pass-through to common helper. Exposed so the GUI can write
+    mihomo.yaml atomically (the same way save_config writes config.json)."""
+    _common.atomic_write_text(path, content, encoding=encoding)
 
 
 def download_rule_set(rs, timeout=20):
@@ -445,6 +476,11 @@ class MihomoRunner:
         self.sudo_pid = None
         self.log_cb = log_cb
         self._tail_thread = None
+        self._tail_stop = threading.Event()
+        # GUI registers a callback here. Fired (off-thread) when the tail
+        # loop notices mihomo died without us calling stop() — i.e. crash,
+        # OOM, panic. The GUI uses this to auto-restart silently.
+        self.on_unexpected_exit = None
 
     def is_running(self):
         if self.proc is not None:
@@ -502,7 +538,17 @@ class MihomoRunner:
     def start(self, mihomo_bin, use_sudo=False):
         if self.is_running():
             return
-        MIHOMO_LOG.write_text("")
+        # Fence off any tail thread from a previous incarnation. Without
+        # this, fast stop()→start() cycles overlap two _tail loops on the
+        # same log; the GUI receives duplicate lines and the watchdog's
+        # is_running()-driven exit detection sees the OLD thread's poll
+        # confusing the OLD process state with the NEW one.
+        self._stop_tail_thread()
+        # Rotate large logs (size-based, single .1 generation). Why not
+        # truncate every restart: previously tracking down "why did mihomo
+        # die last session" required catching it live; now one restart of
+        # history survives.
+        self._rotate_log_if_large()
         if use_sudo:
             self._start_sudo(mihomo_bin)
         else:
@@ -513,8 +559,29 @@ class MihomoRunner:
                 preexec_fn=os.setsid,
             )
             self.log_cb(f"mihomo started (pid={self.proc.pid})")
+        self._tail_stop.clear()
         self._tail_thread = threading.Thread(target=self._tail, daemon=True)
         self._tail_thread.start()
+
+    @staticmethod
+    def _rotate_log_if_large():
+        try:
+            if MIHOMO_LOG.exists() and MIHOMO_LOG.stat().st_size > 10 * 1024 * 1024:
+                rotated = MIHOMO_LOG.with_suffix(".log.1")
+                try:
+                    rotated.unlink()
+                except (OSError, FileNotFoundError):
+                    pass
+                MIHOMO_LOG.rename(rotated)
+        except OSError:
+            pass
+
+    def _stop_tail_thread(self):
+        if self._tail_thread and self._tail_thread.is_alive():
+            self._tail_stop.set()
+            self._tail_thread.join(timeout=0.5)
+        self._tail_thread = None
+        self._tail_stop.clear()
 
     def _start_sudo(self, mihomo_bin):
         if not helper_installed():
@@ -573,12 +640,21 @@ class MihomoRunner:
                 self.log_cb(f"sudo stop error: {e}")
             self.sudo_pid = None
             self.log_cb("mihomo stopped (root)")
+        # Tail thread observes is_running()=False on its next poll and exits;
+        # tell it to stop NOW so we don't wait up to 0.3s for that poll.
+        self._tail_stop.set()
 
     def _tail(self):
+        """Stream mihomo's log to log_cb until either the process dies or
+        the GUI explicitly asks us to stop. If the process dies WITHOUT
+        the GUI asking (`_tail_stop` not set), fire on_unexpected_exit so
+        the GUI can auto-restart."""
         try:
             with open(MIHOMO_LOG, "r") as f:
                 f.seek(0, 2)
-                while self.is_running():
+                while not self._tail_stop.is_set():
+                    if not self.is_running():
+                        break
                     line = f.readline()
                     if not line:
                         time.sleep(0.3)
@@ -586,6 +662,13 @@ class MihomoRunner:
                     self.log_cb(line.rstrip())
         except Exception:
             pass
+        # Distinguish "we asked it to stop" from "it died on us". Only
+        # the latter triggers auto-restart.
+        if not self._tail_stop.is_set() and self.on_unexpected_exit:
+            try:
+                self.on_unexpected_exit()
+            except Exception:
+                pass
 
 
 # ---------- single-instance + window activation ----------
@@ -638,6 +721,7 @@ __all__ = [
     "tcp_reachable", "test_url_through_proxy",
     # platform: system proxy / panic / runner / single instance
     "set_system_proxy", "panic_recover", "bounce_primary_interface",
+    "atomic_write_text",
     "MihomoRunner",
     "acquire_single_instance_lock", "activate_existing_window",
     "get_active_network_service",

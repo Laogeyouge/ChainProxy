@@ -77,6 +77,12 @@ def save_config(cfg):
     _common.save_config(cfg, CONFIG_PATH, SUPPORT_DIR)
 
 
+def atomic_write_text(path, content, encoding="utf-8"):
+    """Pass-through to common helper. Same surface as macOS — used by the
+    GUI for mihomo.yaml."""
+    _common.atomic_write_text(path, content, encoding=encoding)
+
+
 def download_rule_set(rs, timeout=20):
     return _common.download_rule_set(rs, RULESET_DIR, timeout=timeout)
 
@@ -429,6 +435,11 @@ class MihomoRunner:
         self.log_cb = log_cb
         self._tail_thread = None
         self._stop_tail = threading.Event()
+        # GUI registers a callback here. Fired (off-thread) when the tail
+        # loop notices mihomo died without us calling stop() — i.e. crash.
+        # GUI uses this to auto-restart silently. Same surface as macOS
+        # MihomoRunner.
+        self.on_unexpected_exit = None
 
     # ---- liveness ----
     def _pid_alive(self, pid):
@@ -502,10 +513,27 @@ class MihomoRunner:
     def start(self, mihomo_bin, use_sudo=False):
         if self.is_running():
             return
-        # Truncate log before each run so test_url_through_proxy's pos-tracking
-        # in mihomo.log doesn't drift between sessions.
+        # Fence off any tail thread from a previous incarnation. Without
+        # this, fast stop()→start() cycles overlap two _tail loops on the
+        # same log; the GUI receives duplicate lines and the unexpected-exit
+        # callback can fire from the previous tail confusingly.
+        if self._tail_thread and self._tail_thread.is_alive():
+            self._stop_tail.set()
+            self._tail_thread.join(timeout=0.5)
+            self._tail_thread = None
+        # Rotate log if over 10MB. Previously this path truncated on every
+        # start, which controlled size but destroyed history — every restart
+        # wiped any clue about why mihomo died last session. Now we keep
+        # one rotation (.log → .log.1) so recent history survives at least
+        # one restart, but the log can never grow unbounded.
         try:
-            MIHOMO_LOG.write_text("", encoding="utf-8")
+            if MIHOMO_LOG.exists() and MIHOMO_LOG.stat().st_size > 10 * 1024 * 1024:
+                rotated = MIHOMO_LOG.with_suffix(".log.1")
+                try:
+                    rotated.unlink()
+                except (OSError, FileNotFoundError):
+                    pass
+                MIHOMO_LOG.rename(rotated)
         except OSError:
             pass
         # Avoid an extra UAC prompt: if the GUI itself is already running
@@ -693,6 +721,10 @@ class MihomoRunner:
 
     # ---- log tail ----
     def _tail(self):
+        """Stream mihomo's log to log_cb until the process dies or the GUI
+        explicitly asks us to stop. If the process dies WITHOUT the GUI
+        asking (`_stop_tail` not set), fire on_unexpected_exit so the GUI
+        can auto-restart. Same contract as the macOS MihomoRunner._tail."""
         try:
             with open(MIHOMO_LOG, "r", encoding="utf-8", errors="replace") as f:
                 f.seek(0, 2)
@@ -704,6 +736,11 @@ class MihomoRunner:
                     self.log_cb(line.rstrip())
         except Exception:
             pass
+        if not self._stop_tail.is_set() and self.on_unexpected_exit:
+            try:
+                self.on_unexpected_exit()
+            except Exception:
+                pass
 
 
 # ---------- single-instance lock + window activation ----------
@@ -777,6 +814,7 @@ __all__ = [
     "build_mihomo_yaml", "proxy_to_mihomo", "find_mihomo",
     "tcp_reachable", "test_url_through_proxy",
     "set_system_proxy", "panic_recover", "bounce_primary_interface",
+    "atomic_write_text",
     "MihomoRunner",
     "acquire_single_instance_lock", "activate_existing_window",
     "is_elevated", "relaunch_elevated",

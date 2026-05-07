@@ -4,6 +4,7 @@ as arguments so the same code runs on macOS and Windows.
 """
 
 import json
+import os
 import re
 import socket
 import subprocess
@@ -142,12 +143,43 @@ def load_config(config_path: Path, support_dir: Path,
     return cfg
 
 
+_save_lock = threading.Lock()
+
+
+def atomic_write_text(path: Path, content: str, encoding: str = "utf-8"):
+    """Write file content atomically: write to a sibling .tmp, fsync, rename.
+    On all supported platforms (POSIX, Windows since Python 3.3) os.replace
+    is atomic on the same filesystem. Why we need this: previously a crash
+    or kill mid-write would leave a half-truncated file, and on next start
+    mihomo (or load_config) would error out. The bug had been silent until
+    one morning the user found ChainProxy refusing to start with a YAML
+    parse error mid-line."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "w", encoding=encoding) as f:
+        f.write(content)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            # Some filesystems / network mounts return EINVAL on fsync;
+            # the rename is still atomic enough for our use case.
+            pass
+    os.replace(tmp, path)
+
+
 def save_config(cfg, config_path: Path, support_dir: Path):
     support_dir.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(
-        json.dumps(cfg, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    # Lock to serialize concurrent writers (rule-set updater thread vs Qt
+    # main thread). Without this, the JSON output of one writer can
+    # overwrite the other's state mid-flight even with atomic rename,
+    # because the in-memory `cfg` snapshot was lost.
+    with _save_lock:
+        atomic_write_text(
+            config_path,
+            json.dumps(cfg, indent=2, ensure_ascii=False),
+        )
 
 
 def download_rule_set(rs, ruleset_dir: Path, timeout=20):

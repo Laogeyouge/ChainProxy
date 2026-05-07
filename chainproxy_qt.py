@@ -1773,6 +1773,11 @@ class MainWindow(QMainWindow):
         self.q_app = app
         self.cfg = core.load_config()
         self.runner = core.MihomoRunner(self.log)
+        # When mihomo dies on its own (panic / OOM / segfault), the runner
+        # fires this from its tail thread. We bounce to the Qt main thread
+        # so state mutations + restart scheduling stay serialized.
+        self.runner.on_unexpected_exit = lambda: self.qt_invoke(
+            self._on_mihomo_unexpected_exit)
         self.mihomo_bin = core.find_mihomo()
         self._we_set_proxy = False
         self.colors = LIGHT
@@ -1789,6 +1794,13 @@ class MainWindow(QMainWindow):
         self._watchdog_last_restart = 0.0
         self._watchdog_bounced = False
         self._last_watchdog_tick = 0.0
+        # Cleanup gate: _final_cleanup is reachable from closeEvent,
+        # aboutToQuit, atexit, and signal handlers — guard against running
+        # the (potentially slow) sudo-helper invocations more than once.
+        self._final_cleanup_done = False
+        # Distinguishes user-initiated stop from mihomo dying on its own.
+        # Used by MihomoRunner's death callback to decide auto-restart.
+        self._intentional_stop = False
 
         self._build()
         self.refresh_theme()
@@ -2042,23 +2054,25 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, lambda: self.start(silent=True))
 
     def _watchdog_tick(self):
-        """Periodic outbound-connectivity check. If mihomo is alive but its
-        DIAL path is broken (e.g. all DIRECT dials timing out), restart it.
-
-        is_running() only checks the process; mihomo can be stuck with every
-        dial returning i/o timeout / connection refused while still answering
-        its controller. That's the state where 网络急救 helps the user (it
-        kills mihomo + clears routes) but doesn't recover them, and where
-        the user used to have to reboot. The watchdog short-circuits both.
-
-        Failure modes covered:
-          - Chain-only failure (FastLink down, ISP block on first hop) — log only
-          - DIRECT-only failure (auto-detect-interface stuck post-wake) — log only
-          - BOTH failing — system-level breakage; restart, then bounce iface
-          - System sleep/wake (timer gap > 90s) — proactive restart at +8s"""
+        """Schedule a connectivity probe on a worker thread. The actual
+        probes (HTTP/SOCKS5 to local mixed-port) can each block up to 5s;
+        running them on the Qt main thread froze the GUI for up to 10s
+        every 30s during outages. We dispatch off-thread and post results
+        back via qt_invoke."""
         now = time.time()
         last_tick = getattr(self, "_last_watchdog_tick", 0.0)
         self._last_watchdog_tick = now
+
+        # macOS: detect a foreign mihomo TUN that came up AFTER us. Preflight
+        # only runs once at start; if the user later opens FastLink/Mihomo
+        # Party/ClashX and turns on its TUN, both clients fight over
+        # 198.18.0.1 and routes flap. We can't fix it for them, but we can
+        # tell them clearly instead of leaving them debugging. Throttle the
+        # warning so we don't spam every 30s.
+        if (sys.platform == "darwin"
+                and self.runner.is_running()
+                and self.cfg.get("tun_mode")):
+            self._check_for_foreign_tun()
         # 30s cadence; >90s gap = system slept. macOS's PFROUTE sometimes
         # doesn't fire route-change events for the wake transition, so
         # mihomo's auto-detect stays bound to pre-sleep socket state and
@@ -2078,9 +2092,36 @@ class MainWindow(QMainWindow):
         if not started or (now - started) < 60:
             # Warm-up: rule sets, GeoIP DB, fakeip cache loading from disk.
             return
+        # Reentrancy guard: if a previous probe is still in flight (slow
+        # mihomo, network hung), don't pile up workers.
+        if getattr(self, "_watchdog_probe_inflight", False):
+            return
+        self._watchdog_probe_inflight = True
+        threading.Thread(target=self._watchdog_probe_worker,
+                         args=(now,), daemon=True).start()
 
-        chain_ok = self._probe_chain()
-        direct_ok = self._probe_direct()
+    def _watchdog_probe_worker(self, sample_time: float):
+        """Off-thread: run probes, post outcome back to Qt main thread for
+        decision-making (state mutations + restart scheduling must run on
+        the main thread to keep them serialized with start/stop clicks)."""
+        try:
+            chain_ok = self._probe_chain()
+            direct_ok = self._probe_direct()
+        except Exception:
+            chain_ok = direct_ok = False
+        self.qt_invoke(lambda: self._on_watchdog_probe_result(
+            sample_time, chain_ok, direct_ok))
+
+    def _on_watchdog_probe_result(self, sample_time: float,
+                                   chain_ok: bool, direct_ok: bool):
+        """Main-thread continuation of _watchdog_tick. Sees the probe
+        outcomes and decides: ignore / log / restart / bounce-iface."""
+        self._watchdog_probe_inflight = False
+        # Defensive: mihomo may have died while probes were in flight.
+        if not self.runner.is_running():
+            self._watchdog_failures = 0
+            self._watchdog_bounced = False
+            return
 
         if chain_ok and direct_ok:
             if self._watchdog_failures > 0:
@@ -2104,6 +2145,7 @@ class MainWindow(QMainWindow):
         if self._watchdog_failures < 2:
             return
 
+        now = time.time()
         # If we already restarted recently and BOTH probes are STILL failing,
         # the kernel-level interface state is wedged — restart can't recover
         # it. Bounce the primary interface (sudo helper). Only try this once
@@ -2124,8 +2166,50 @@ class MainWindow(QMainWindow):
         self._watchdog_bounced = False
         self.log("⚠ mihomo 出站持续不通，自动重启…")
         self.toast("网络异常，自动重启 mihomo")
+        self._intentional_stop = True
         self.stop(cancel_pending_restart=False)
         QTimer.singleShot(500, lambda: self.start(silent=True))
+
+    def _check_for_foreign_tun(self):
+        """If the kernel routes 198.18.0.1 to a utun other than ours, another
+        mihomo-based client (FastLink, Mihomo Party, ClashX, …) opened its
+        TUN after we did. We detect this by counting utun interfaces that
+        currently have 198.18.0.1 configured. If >1, conflict.
+
+        We don't know our own utun ifname directly (helper-spawned mihomo,
+        no shared state). Fallback: any 198.18.0.1-bearing utun beyond the
+        first counts as foreign. Throttled to once per 5 min per warning,
+        otherwise the toast spams the user."""
+        now = time.time()
+        last = getattr(self, "_foreign_tun_warned_at", 0.0)
+        if now - last < 300:
+            return
+        try:
+            r = subprocess.run(
+                ["/sbin/ifconfig", "-l"],
+                capture_output=True, text=True, timeout=2,
+            )
+            utun_names = [n for n in r.stdout.split() if n.startswith("utun")]
+        except Exception:
+            return
+        owners = []
+        for u in utun_names:
+            try:
+                r = subprocess.run(
+                    ["/sbin/ifconfig", u],
+                    capture_output=True, text=True, timeout=1,
+                )
+                if "198.18.0.1" in r.stdout:
+                    owners.append(u)
+            except Exception:
+                continue
+        if len(owners) > 1:
+            self._foreign_tun_warned_at = now
+            others = ", ".join(owners[1:])
+            self.log(f"⚠ 检测到另一个 mihomo TUN 占用 198.18.0.1（{others}）。"
+                     "请关闭 FastLink/Mihomo Party/ClashX 等的 TUN 模式，"
+                     "否则路由会互相破坏。")
+            self.toast("检测到另一个代理客户端的 TUN 冲突", error=True)
 
     def _post_wake_recover(self):
         """Called 8s after a detected sleep→wake transition. Force a clean
@@ -2160,55 +2244,29 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(500, lambda: self.start(silent=True))
         self.qt_invoke(lambda: QTimer.singleShot(3000, restart))
 
-    def _probe_chain(self) -> bool:
-        """HEAD `http://www.baidu.com/` through the local mixed-port. Tests
-        the Chain path (baidu falls through to the MATCH rule which is
-        FirstHopOnly in user configs, so this exercises first-hop dial)."""
-        import http.client
-        try:
-            port = int(self.cfg.get("local_port", 7890))
-        except (TypeError, ValueError):
-            return True  # don't false-alarm on bad config
-        conn = None
-        try:
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=4)
-            conn.request("HEAD", "http://www.baidu.com/", headers={
-                "Host": "www.baidu.com",
-                "User-Agent": "ChainProxy-watchdog/1.0",
-            })
-            resp = conn.getresponse()
-            return 100 <= resp.status < 600
-        except Exception:
-            return False
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-    def _probe_direct(self) -> bool:
-        """SOCKS5 CONNECT to 223.5.5.5:443 via the mixed-port. AliDNS is in
-        GEOIP CN → DIRECT, so this exercises the DIRECT outbound path
-        specifically — the path that breaks after sleep/wake when Chain
-        (going through the upstream proxy) still appears to work."""
+    def _socks5_connect_probe(self, target_ip: str, target_port: int) -> bool:
+        """SOCKS5 CONNECT to a literal IP via the local mixed-port. We use IP
+        (not hostname) on purpose — the rule engine then dispatches by
+        IP-CIDR / GEOIP / MATCH without DNS, giving us deterministic routing
+        even if fakeip is broken. Mihomo only sends rep=0 once the outbound
+        TCP handshake succeeds, so a failed dial = failed probe."""
         import socket, struct
         try:
             port = int(self.cfg.get("local_port", 7890))
         except (TypeError, ValueError):
-            return True
+            return True  # don't false-alarm on bad config
         s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(4)
+            s.settimeout(5)
             s.connect(("127.0.0.1", port))
             s.sendall(b"\x05\x01\x00")  # SOCKS5, 1 method, no-auth
             resp = s.recv(2)
             if len(resp) != 2 or resp[0] != 0x05 or resp[1] != 0x00:
                 return False
             req = (b"\x05\x01\x00\x01"
-                   + socket.inet_aton("223.5.5.5")
-                   + struct.pack(">H", 443))
+                   + socket.inet_aton(target_ip)
+                   + struct.pack(">H", target_port))
             s.sendall(req)
             resp = s.recv(10)
             return len(resp) >= 2 and resp[0] == 0x05 and resp[1] == 0x00
@@ -2220,6 +2278,22 @@ class MainWindow(QMainWindow):
                     s.close()
                 except Exception:
                     pass
+
+    def _probe_chain(self) -> bool:
+        """SOCKS5 CONNECT to 8.8.8.8:443. Non-CN IP not in any cncidr/lan
+        ruleset, falls through to MATCH (which is FirstHopOnly or Chain in
+        all user configs we've seen) — so this exercises the upstream-proxy
+        outbound path. If the user's first-hop client is closed, this fails
+        (and the watchdog logs without restarting, since single-path
+        failure is upstream-specific)."""
+        return self._socks5_connect_probe("8.8.8.8", 443)
+
+    def _probe_direct(self) -> bool:
+        """SOCKS5 CONNECT to 223.5.5.5:443 via the mixed-port. AliDNS is in
+        GEOIP CN → DIRECT, so this exercises the DIRECT outbound path —
+        the path that breaks after sleep/wake when Chain (going through
+        the upstream proxy at 127.0.0.1) still appears to work."""
+        return self._socks5_connect_probe("223.5.5.5", 443)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -2290,7 +2364,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             fail("配置错误", str(e), critical=True)
             return
-        core.MIHOMO_YAML.write_text(yaml, encoding="utf-8")
+        # Atomic write so a crash mid-write can't leave mihomo with a
+        # half-truncated YAML on next start.
+        core.atomic_write_text(core.MIHOMO_YAML, yaml)
         use_sudo = bool(self.cfg.get("tun_mode"))
         try:
             self.runner.start(self.mihomo_bin, use_sudo=use_sudo)
@@ -2304,6 +2380,7 @@ class MainWindow(QMainWindow):
         # authoritative liveness check available without async I/O.
         if not self._wait_until_listening(int(self.cfg["controller_port"]),
                                           timeout_s=2.0):
+            self._intentional_stop = True  # we're killing it deliberately
             try:
                 self.runner.stop()
             except Exception:
@@ -2321,6 +2398,9 @@ class MainWindow(QMainWindow):
         self._mihomo_started_at = time.time()
         self._watchdog_failures = 0
         self._watchdog_bounced = False
+        # New incarnation: any death from here on is unexpected (until the
+        # user clicks stop or another deliberate-stop path runs).
+        self._intentional_stop = False
         self._tick()
 
     def _cleanup_orphan_proxy_state(self):
@@ -2388,6 +2468,13 @@ class MainWindow(QMainWindow):
     def stop(self, cancel_pending_restart: bool = True):
         if cancel_pending_restart and hasattr(self, "_restart_timer"):
             self._restart_timer.stop()
+        # Mark this stop as user-initiated. The runner's tail thread checks
+        # this flag (via _intentional_stop) to decide whether to fire
+        # on_unexpected_exit when it sees mihomo gone. Without this, every
+        # stop click would race with the death detector and either trigger
+        # a phantom auto-restart or, in the other order, silently swallow
+        # a real crash that happened to land during a stop.
+        self._intentional_stop = True
         try:
             self.runner.stop()
         except Exception as e:
@@ -2436,6 +2523,7 @@ class MainWindow(QMainWindow):
         # the kernel route table wedged at L3, and mihomo restart alone
         # can't fix that. Bouncing forces ARP/route refresh + DHCP renew.
         was_running = self.runner.is_running()
+        self._intentional_stop = True  # rescue is user-initiated
         def worker():
             try: self.runner.stop()
             except Exception: pass
@@ -2457,6 +2545,26 @@ class MainWindow(QMainWindow):
             else:
                 self.qt_invoke(lambda: self.toast("已恢复网络"))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mihomo_unexpected_exit(self):
+        """mihomo died without us asking. Symptoms: panic on bad rule-set,
+        OOM, segfault, SIGKILL from outside. The watchdog wouldn't catch
+        this because is_running()=False after death — its outbound probe
+        only triggers when alive-but-stuck. Auto-restart silently with
+        the same backoff cap as the watchdog (180s window) to keep a
+        crashloop from masking a real bug."""
+        if self._intentional_stop:
+            self._intentional_stop = False
+            return
+        now = time.time()
+        if now - self._watchdog_last_restart < 180:
+            self.log("⚠ mihomo 进程意外退出，但最近刚重启过 — 跳过自动拉起，避免 crashloop")
+            self.toast("mihomo 反复崩溃，请检查规则/配置", error=True)
+            return
+        self._watchdog_last_restart = now
+        self.log("⚠ mihomo 进程意外退出，自动拉起…")
+        self.toast("mihomo 已崩溃，自动重启")
+        QTimer.singleShot(500, lambda: self.start(silent=True))
 
     # ── system tray ───────────────────────────────────────────────────────
     def _build_tray(self):
@@ -2510,6 +2618,38 @@ class MainWindow(QMainWindow):
         self._tray_quit = True
         self.close()
 
+    def _final_cleanup(self):
+        """Synchronous cleanup invoked from any process-exit path:
+        closeEvent, app.aboutToQuit, atexit, SIGTERM/SIGHUP. Without this,
+        force-quitting the GUI (Cmd-Opt-Esc, OS shutdown, kill -TERM)
+        leaves mihomo running and TUN routes hijacking 198.18.0.1 — user
+        finds Wi-Fi 'broken' until they reboot or manually kill mihomo.
+        Idempotent: the gate flag guards against running twice when more
+        than one exit hook fires."""
+        if self._final_cleanup_done:
+            return
+        self._final_cleanup_done = True
+        self._intentional_stop = True
+        try:
+            if self.runner.is_running():
+                self.runner.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_we_set_proxy", False):
+                core.set_system_proxy(0, enable=False)
+        except Exception:
+            pass
+        # macOS TUN: helper recover wipes routes/utun even if runner.stop
+        # already did so (defensive — we don't want a dead utun4 to outlive
+        # us). Pass a no-op log so we don't try to write to a Qt UI that's
+        # in the middle of tearing down.
+        if sys.platform == "darwin" and self.cfg.get("tun_mode"):
+            try:
+                core.panic_recover(lambda *_a, **_kw: None)
+            except Exception:
+                pass
+
     def closeEvent(self, e):
         # Closing the window without an explicit quit minimizes to the tray
         # so the proxy keeps running. Hide rather than terminate.
@@ -2537,6 +2677,7 @@ class MainWindow(QMainWindow):
                 e.ignore()
                 self._tray_quit = False  # cancel: don't quit, but don't hide either
                 return
+            self._intentional_stop = True
             try: self.runner.stop()
             except Exception: pass
             if self._we_set_proxy:
@@ -2628,6 +2769,30 @@ def main():
     w = MainWindow(app)
     if icon_path:
         w.setWindowIcon(QIcon(icon_path))
+
+    # Catch every "the GUI is going away" path so mihomo doesn't outlive us.
+    # closeEvent handles user-initiated window close. The hooks below cover:
+    #   - app.aboutToQuit : Cmd-Q, tray-quit, programmatic QApplication.quit()
+    #   - SIGTERM / SIGHUP : kill, OS shutdown handlers (Unix)
+    #   - atexit : last-line-of-defense for unhandled paths
+    # Without these, force-quit / kill -TERM / system reboot leave mihomo
+    # running and the TUN routes hijacking 198.18.0.1 — the user reboots
+    # and the network is "broken" until manual intervention.
+    import atexit
+    app.aboutToQuit.connect(w._final_cleanup)
+    atexit.register(w._final_cleanup)
+    if sys.platform != "win32":
+        import signal
+        def _on_term_signal(_signum, _frame):
+            QApplication.quit()
+        try:
+            signal.signal(signal.SIGTERM, _on_term_signal)
+            signal.signal(signal.SIGHUP, _on_term_signal)
+        except (OSError, ValueError):
+            # Not on main thread (we are, but be safe) or signal not
+            # available — silently skip; aboutToQuit + atexit still cover us.
+            pass
+
     w.show()
     w.raise_()
     w.activateWindow()
