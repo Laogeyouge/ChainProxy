@@ -447,6 +447,13 @@ def panic_recover(log_cb):
     log_cb("==================")
 
 
+def refresh_system_proxy():
+    """Cross-platform hook (paired with the Windows implementation). On
+    macOS, networksetup writes per-service config that's read live by
+    apps; there's no WinINET-style cache to flush. No-op."""
+    pass
+
+
 def bounce_primary_interface(log_cb):
     """Bounce the macOS primary network interface. The helper auto-detects
     en0/en1/etc. from the default route and runs ifconfig down/up + DHCP
@@ -721,6 +728,7 @@ __all__ = [
     "tcp_reachable", "test_url_through_proxy",
     # platform: system proxy / panic / runner / single instance
     "set_system_proxy", "panic_recover", "bounce_primary_interface",
+    "refresh_system_proxy",
     "atomic_write_text",
     "MihomoRunner",
     "acquire_single_instance_lock", "activate_existing_window",

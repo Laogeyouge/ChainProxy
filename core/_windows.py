@@ -190,6 +190,22 @@ def _refresh_wininet():
         pass
 
 
+def refresh_system_proxy():
+    """Cross-platform hook the GUI calls after a brief sleep/wake to make
+    sure the OS's per-app proxy state is consistent with the registry.
+
+    On Windows, WinINET caches proxy values per process; after wake, some
+    apps (especially long-running browser tabs) hold the cache from before
+    sleep, causing requests to bypass mihomo until the app is restarted.
+    Reapplying SETTINGS_CHANGED + REFRESH kicks WinINET to re-read the
+    registry, which already points at our local port. Idempotent and
+    cheap (~1 ms) — safe to call from the watchdog tier-1 path.
+
+    On macOS this is a no-op (the system proxy is per-service via
+    networksetup, with no per-process cache that needs flushing)."""
+    _refresh_wininet()
+
+
 def _proxy_backup_path():
     """File we stash the user's pre-ChainProxy proxy values into. Living
     under SUPPORT_DIR means it survives across GUI restarts but isn't shared
@@ -814,6 +830,7 @@ __all__ = [
     "build_mihomo_yaml", "proxy_to_mihomo", "find_mihomo",
     "tcp_reachable", "test_url_through_proxy",
     "set_system_proxy", "panic_recover", "bounce_primary_interface",
+    "refresh_system_proxy",
     "atomic_write_text",
     "MihomoRunner",
     "acquire_single_instance_lock", "activate_existing_window",

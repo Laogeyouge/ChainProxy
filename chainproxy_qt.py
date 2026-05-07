@@ -2196,7 +2196,14 @@ class MainWindow(QMainWindow):
         each conn server-side, the apps see EOF/RST on their next read,
         retry, and reconnect via mihomo's outbound — all within a second.
         Without this, WeChat / Slack / browsers sit on dead sockets for
-        10-30s before TCP-keepalive or app-level retry kicks them."""
+        10-30s before TCP-keepalive or app-level retry kicks them.
+
+        On Windows we additionally refresh WinINET state. Apps using
+        WinINet (Edge, Chrome, .NET HTTP client, …) cache proxy state
+        per-process; after a sleep/wake some keep the pre-sleep cache and
+        bypass our local port until restarted. The Windows TCP keepalive
+        default is also far longer than macOS (~2h vs ~75min), so
+        eviction matters even more there."""
         import urllib.request, urllib.error
         try:
             port = int(self.cfg.get("controller_port", 9999))
@@ -2213,6 +2220,12 @@ class MainWindow(QMainWindow):
             self.qt_invoke(lambda: self.log("✓ 已清理 mihomo 陈旧连接"))
         except (urllib.error.URLError, OSError, ValueError) as e:
             self.qt_invoke(lambda: self.log(f"⚠ 清理陈旧连接失败: {e}"))
+        # macOS: no-op. Windows: kick WinINET so cached pre-sleep proxy
+        # state gets re-read from the registry by long-running apps.
+        try:
+            core.refresh_system_proxy()
+        except Exception as e:
+            self.qt_invoke(lambda: self.log(f"⚠ 刷新系统代理状态失败: {e}"))
 
     def _check_for_foreign_tun(self):
         """If the kernel routes 198.18.0.1 to a utun other than ours, another
