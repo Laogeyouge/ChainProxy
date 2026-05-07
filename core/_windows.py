@@ -406,6 +406,14 @@ def panic_recover(log_cb):
     log_cb("==================")
 
 
+def bounce_primary_interface(log_cb):
+    """Windows stub. macOS-specific recovery; Windows handles sleep/wake at
+    the OS level differently (NDIS reset on resume) and we have no equivalent
+    user-mode recovery story. Surface as no-op so cross-platform callers can
+    call uniformly."""
+    log_cb("  (Windows: 跳过网卡重置)")
+
+
 # ---------- mihomo process manager ----------
 
 class MihomoRunner:
@@ -768,7 +776,8 @@ __all__ = [
     "update_all_rule_sets", "rule_set_local_path_exists",
     "build_mihomo_yaml", "proxy_to_mihomo", "find_mihomo",
     "tcp_reachable", "test_url_through_proxy",
-    "set_system_proxy", "panic_recover", "MihomoRunner",
+    "set_system_proxy", "panic_recover", "bounce_primary_interface",
+    "MihomoRunner",
     "acquire_single_instance_lock", "activate_existing_window",
     "is_elevated", "relaunch_elevated",
     "_read_proxy_state", "_DEFAULT_BYPASS",

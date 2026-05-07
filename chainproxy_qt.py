@@ -1787,6 +1787,8 @@ class MainWindow(QMainWindow):
         self._mihomo_started_at = 0.0
         self._watchdog_failures = 0
         self._watchdog_last_restart = 0.0
+        self._watchdog_bounced = False
+        self._last_watchdog_tick = 0.0
 
         self._build()
         self.refresh_theme()
@@ -2047,42 +2049,121 @@ class MainWindow(QMainWindow):
         dial returning i/o timeout / connection refused while still answering
         its controller. That's the state where 网络急救 helps the user (it
         kills mihomo + clears routes) but doesn't recover them, and where
-        the user used to have to reboot. The watchdog short-circuits both."""
+        the user used to have to reboot. The watchdog short-circuits both.
+
+        Failure modes covered:
+          - Chain-only failure (FastLink down, ISP block on first hop) — log only
+          - DIRECT-only failure (auto-detect-interface stuck post-wake) — log only
+          - BOTH failing — system-level breakage; restart, then bounce iface
+          - System sleep/wake (timer gap > 90s) — proactive restart at +8s"""
+        now = time.time()
+        last_tick = getattr(self, "_last_watchdog_tick", 0.0)
+        self._last_watchdog_tick = now
+        # 30s cadence; >90s gap = system slept. macOS's PFROUTE sometimes
+        # doesn't fire route-change events for the wake transition, so
+        # mihomo's auto-detect stays bound to pre-sleep socket state and
+        # every dial fails. Force a clean restart 8s after wake (give Wi-Fi
+        # time to re-associate and DHCP to renew before mihomo binds again).
+        if last_tick > 0 and (now - last_tick) > 90 and self.runner.is_running():
+            gap = int(now - last_tick)
+            self.log(f"⌁ 检测到系统休眠/唤醒（间隔 {gap}s），8s 后重启 mihomo 刷新出站状态")
+            QTimer.singleShot(8000, self._post_wake_recover)
+            return
+
         if not self.runner.is_running():
             self._watchdog_failures = 0
+            self._watchdog_bounced = False
             return
         started = self._mihomo_started_at
-        if not started or (time.time() - started) < 60:
+        if not started or (now - started) < 60:
             # Warm-up: rule sets, GeoIP DB, fakeip cache loading from disk.
             return
-        if self._probe_outbound():
+
+        chain_ok = self._probe_chain()
+        direct_ok = self._probe_direct()
+
+        if chain_ok and direct_ok:
             if self._watchdog_failures > 0:
                 self.log("✓ 网络出站已恢复")
             self._watchdog_failures = 0
+            self._watchdog_bounced = False
             return
+
+        # Single-path failure is usually upstream-specific: Chain fails when
+        # the first-hop client is closed; DIRECT fails when ISP RSTs. mihomo
+        # restart can't fix either — only log, don't act.
+        if chain_ok or direct_ok:
+            failing = "DIRECT" if not direct_ok else "Chain"
+            self.log(f"⚠ {failing} 路径异常（单路径，不重启）")
+            self._watchdog_failures = 0
+            return
+
+        # Both paths down → system-level state breakage.
         self._watchdog_failures += 1
-        self.log(f"⚠ 出站健康探测失败 ({self._watchdog_failures}/2)")
+        self.log(f"⚠ 双路径出站不通 ({self._watchdog_failures}/2)")
         if self._watchdog_failures < 2:
             return
-        now = time.time()
-        # If we just restarted and outbound is STILL broken, the issue isn't
-        # mihomo state — it's upstream (WiFi down, ISP, first-hop client off).
-        # Don't loop-restart; surface to the user.
+
+        # If we already restarted recently and BOTH probes are STILL failing,
+        # the kernel-level interface state is wedged — restart can't recover
+        # it. Bounce the primary interface (sudo helper). Only try this once
+        # per failure cycle; if it ALSO doesn't help, surface to the user.
         if now - self._watchdog_last_restart < 180:
+            if not getattr(self, "_watchdog_bounced", False):
+                self._watchdog_bounced = True
+                self.log("⚠ 重启 mihomo 后仍不通，触发底层网卡重置…")
+                self.toast("尝试重置网卡…")
+                threading.Thread(target=self._deep_recover_worker,
+                                 daemon=True).start()
+                return
             self.toast("网络持续异常，请检查 WiFi/上游代理", error=True)
             return
+
         self._watchdog_last_restart = now
         self._watchdog_failures = 0
+        self._watchdog_bounced = False
         self.log("⚠ mihomo 出站持续不通，自动重启…")
         self.toast("网络异常，自动重启 mihomo")
         self.stop(cancel_pending_restart=False)
         QTimer.singleShot(500, lambda: self.start(silent=True))
 
-    def _probe_outbound(self) -> bool:
-        """HEAD `http://www.baidu.com/` through the local mixed-port. We
-        probe THROUGH mihomo (not direct) so a TUN loop / route conflict /
-        DNS upstream death registers as failure. Any HTTP response counts —
-        we just need to know the dial-and-talk path is alive."""
+    def _post_wake_recover(self):
+        """Called 8s after a detected sleep→wake transition. Force a clean
+        mihomo restart to refresh interface bindings and route monitor."""
+        if not self.runner.is_running():
+            return
+        self.log("⌁ 系统已唤醒，重启 mihomo")
+        self._watchdog_last_restart = time.time()
+        self._watchdog_failures = 0
+        self._watchdog_bounced = False
+        self.stop(cancel_pending_restart=False)
+        QTimer.singleShot(500, lambda: self.start(silent=True))
+
+    def _deep_recover_worker(self):
+        """Off-thread: bounce the primary OS interface, then restart mihomo.
+        Used when post-restart probes still fail — i.e. mihomo's outbound
+        socket is fine but the kernel route through Wi-Fi/Ethernet is dead
+        (typical after sleep/wake or DHCP lease expiry)."""
+        try:
+            core.bounce_primary_interface(self.log)
+        except Exception as e:
+            self.qt_invoke(lambda: self.log(f"⚠ 网卡重置失败: {e}"))
+            self.qt_invoke(lambda: self.toast("网卡重置失败", error=True))
+            return
+        self.qt_invoke(lambda: self.toast("网卡已重置，等待链路恢复…"))
+        # Give the interface 3s to come back up + DHCP, then restart mihomo
+        # so its outbound binds to the fresh route table.
+        def restart():
+            self._watchdog_last_restart = time.time()
+            self._watchdog_failures = 0
+            self.stop(cancel_pending_restart=False)
+            QTimer.singleShot(500, lambda: self.start(silent=True))
+        self.qt_invoke(lambda: QTimer.singleShot(3000, restart))
+
+    def _probe_chain(self) -> bool:
+        """HEAD `http://www.baidu.com/` through the local mixed-port. Tests
+        the Chain path (baidu falls through to the MATCH rule which is
+        FirstHopOnly in user configs, so this exercises first-hop dial)."""
         import http.client
         try:
             port = int(self.cfg.get("local_port", 7890))
@@ -2103,6 +2184,40 @@ class MainWindow(QMainWindow):
             if conn is not None:
                 try:
                     conn.close()
+                except Exception:
+                    pass
+
+    def _probe_direct(self) -> bool:
+        """SOCKS5 CONNECT to 223.5.5.5:443 via the mixed-port. AliDNS is in
+        GEOIP CN → DIRECT, so this exercises the DIRECT outbound path
+        specifically — the path that breaks after sleep/wake when Chain
+        (going through the upstream proxy) still appears to work."""
+        import socket, struct
+        try:
+            port = int(self.cfg.get("local_port", 7890))
+        except (TypeError, ValueError):
+            return True
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(4)
+            s.connect(("127.0.0.1", port))
+            s.sendall(b"\x05\x01\x00")  # SOCKS5, 1 method, no-auth
+            resp = s.recv(2)
+            if len(resp) != 2 or resp[0] != 0x05 or resp[1] != 0x00:
+                return False
+            req = (b"\x05\x01\x00\x01"
+                   + socket.inet_aton("223.5.5.5")
+                   + struct.pack(">H", 443))
+            s.sendall(req)
+            resp = s.recv(10)
+            return len(resp) >= 2 and resp[0] == 0x05 and resp[1] == 0x00
+        except Exception:
+            return False
+        finally:
+            if s is not None:
+                try:
+                    s.close()
                 except Exception:
                     pass
 
@@ -2205,6 +2320,7 @@ class MainWindow(QMainWindow):
             self.log("TUN 模式已启用，无需设系统代理")
         self._mihomo_started_at = time.time()
         self._watchdog_failures = 0
+        self._watchdog_bounced = False
         self._tick()
 
     def _cleanup_orphan_proxy_state(self):
@@ -2280,6 +2396,7 @@ class MainWindow(QMainWindow):
             self.toggle_system_proxy(False)
         self._mihomo_started_at = 0.0
         self._watchdog_failures = 0
+        self._watchdog_bounced = False
         self._tick()
 
     def toggle_system_proxy(self, on):
@@ -2302,8 +2419,10 @@ class MainWindow(QMainWindow):
 
     def panic_recover(self):
         if sys.platform == "darwin":
-            prompt = ("执行：清系统代理 + 杀残留 mihomo + 删 TUN 路由 + 关 utun，"
-                      "然后用全新状态重启 mihomo。\n\n继续？")
+            prompt = ("执行：清系统代理 + 杀残留 mihomo + 删 TUN 路由 + 关 utun "
+                      "+ 重置主网卡（Wi-Fi/有线 down/up + DHCP 续约），"
+                      "然后用全新状态重启 mihomo。\n\n"
+                      "网卡会断开 2-3 秒。继续？")
         else:
             prompt = ("执行：清系统代理 + 杀残留 mihomo.exe，然后用全新状态重启。\n\n继续？")
         if QMessageBox.question(self, "网络急救", prompt) != QMessageBox.StandardButton.Yes:
@@ -2313,14 +2432,28 @@ class MainWindow(QMainWindow):
         # fresh routes, fresh DNS) — not a "rescued but proxy off" limbo.
         # Without this, prior users found 网络急救 "useless" because it left
         # them with no proxy AND any other-process state still poisoned.
+        # We also bounce the primary interface on macOS — sleep/wake leaves
+        # the kernel route table wedged at L3, and mihomo restart alone
+        # can't fix that. Bouncing forces ARP/route refresh + DHCP renew.
         was_running = self.runner.is_running()
         def worker():
             try: self.runner.stop()
             except Exception: pass
-            core.panic_recover(self.log)
+            try:
+                core.panic_recover(self.log)
+            except Exception as e:
+                self.qt_invoke(lambda: self.log(f"⚠ 清理失败: {e}"))
+            if sys.platform == "darwin":
+                try:
+                    core.bounce_primary_interface(self.log)
+                except Exception as e:
+                    self.qt_invoke(lambda: self.log(f"⚠ 网卡重置失败: {e}"))
             if was_running:
-                self.qt_invoke(lambda: self.toast("清理完成，重启 mihomo…"))
-                self.qt_invoke(lambda: self.start(silent=True))
+                self.qt_invoke(lambda: self.toast("清理完成，3s 后重启 mihomo…"))
+                # Give the bounced interface a moment to come back up + DHCP
+                # before mihomo's auto-detect-interface samples the route.
+                self.qt_invoke(lambda: QTimer.singleShot(
+                    3000, lambda: self.start(silent=True)))
             else:
                 self.qt_invoke(lambda: self.toast("已恢复网络"))
         threading.Thread(target=worker, daemon=True).start()

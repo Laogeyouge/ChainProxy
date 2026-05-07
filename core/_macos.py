@@ -37,11 +37,11 @@ MIHOMO_BIN_CANDIDATES = [
 # ---------- helper-script for TUN privilege ----------
 HELPER_PATH = "/usr/local/bin/chainproxy-helper.sh"
 SUDOERS_PATH = "/etc/sudoers.d/chainproxy"
-HELPER_VERSION = "6"
+HELPER_VERSION = "7"
 HELPER_SCRIPT = r"""#!/bin/bash
-# version: 6
+# version: 7
 # ChainProxy mihomo helper. Managed by ChainProxy.app — DO NOT EDIT.
-# Args: <runtime-dir> <action: start|stop|status|recover|flush-dns> [yaml-path]
+# Args: <runtime-dir> <action: start|stop|status|recover|flush-dns|bounce-iface> [yaml-path]
 set -e
 RUNTIME="$1"
 ACTION="$2"
@@ -112,6 +112,27 @@ flush_dns() {
   /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true
 }
 
+# Why: macOS sleep/wake can leave the primary interface in a wedged state where
+# every outbound dial returns "connection refused" or i/o timeout — even after
+# mihomo restarts with fresh internal state. The TUN sees a default interface
+# (en0), but the kernel route through it is broken at L3 until the interface
+# is bounced. This is the failure mode where "网络急救 doesn't work" and the
+# user reaches for a reboot. Bouncing the primary interface forces ARP/route
+# refresh and (for Wi-Fi) re-association, restoring the underlying path that
+# mihomo's auto-route depends on. We also re-acquire DHCP because some upstream
+# routers expire the lease during sleep.
+bounce_iface() {
+  iface=$(/sbin/route -n get default 2>/dev/null \
+            | awk '/interface:/ {print $2; exit}')
+  [ -z "$iface" ] && iface="en0"
+  echo "  bouncing $iface" >&2
+  /sbin/ifconfig "$iface" down 2>/dev/null || true
+  sleep 1
+  /sbin/ifconfig "$iface" up 2>/dev/null || true
+  /usr/sbin/ipconfig set "$iface" DHCP 2>/dev/null || true
+  echo "bounced $iface"
+}
+
 kill_orphans() {
   pkill -TERM -f "mihomo -d $RUNTIME" 2>/dev/null || true
   for i in $(seq 1 15); do
@@ -175,6 +196,9 @@ case "$ACTION" in
     flush_dns
     echo "dns flushed"
     ;;
+  bounce-iface)
+    bounce_iface
+    ;;
   status)
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
       echo "running pid=$(cat "$PIDFILE")"
@@ -185,7 +209,7 @@ case "$ACTION" in
     fi
     ;;
   *)
-    echo "usage: $0 RUNTIME start|stop|status|recover|flush-dns [YAML]" >&2
+    echo "usage: $0 RUNTIME start|stop|status|recover|flush-dns|bounce-iface [YAML]" >&2
     exit 2
     ;;
 esac
@@ -392,6 +416,27 @@ def panic_recover(log_cb):
     log_cb("==================")
 
 
+def bounce_primary_interface(log_cb):
+    """Bounce the macOS primary network interface. The helper auto-detects
+    en0/en1/etc. from the default route and runs ifconfig down/up + DHCP
+    renew. Required after sleep/wake when L3 is wedged — restarting mihomo
+    alone can't fix that, the kernel needs to refresh the route entries."""
+    if not helper_installed():
+        raise RuntimeError("sudo helper 未安装，无法重置网卡")
+    r = subprocess.run(
+        ["sudo", "-n", HELPER_PATH, str(RUNTIME_DIR), "bounce-iface"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"bounce-iface failed (exit {r.returncode}): "
+            f"{(r.stderr or r.stdout or '').strip()}"
+        )
+    out = (r.stdout or r.stderr or "").strip()
+    if out:
+        log_cb(f"  {out}")
+
+
 # ---------- mihomo process manager ----------
 
 class MihomoRunner:
@@ -592,7 +637,8 @@ __all__ = [
     # network probes / tests
     "tcp_reachable", "test_url_through_proxy",
     # platform: system proxy / panic / runner / single instance
-    "set_system_proxy", "panic_recover", "MihomoRunner",
+    "set_system_proxy", "panic_recover", "bounce_primary_interface",
+    "MihomoRunner",
     "acquire_single_instance_lock", "activate_existing_window",
     "get_active_network_service",
 ]
