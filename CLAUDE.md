@@ -87,18 +87,57 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
 - 不要弹"我做了 X"的总结，用户自己看 diff
 - 节点信息绝对不能进 git（仓库已脱敏，`.gitignore` 里有 `config.json`）
 
-## 当前状态（2026-05-05）
+## 当前状态（2026-05-09）
 
-- ✅ macOS 版 1.0.1 已发布
-- ✅ Windows 版完成端到端移植 + 真机验证：
-  - core 拆成平台分发（`core/_common.py` + `core/_macos.py` + `core/_windows.py`）
-  - 系统代理：HKCU 注册表 snapshot/restore，启动失败时自动恢复用户原代理
-  - TUN：GUI 启动时一次 UAC（`relaunch_elevated`），整个会话启停 mihomo 不再弹
-  - mihomo 启动后 poll controller 端口 2 秒确认存活，避免代理被设到死端口
-  - 规则集监控：mihomo controller `/logs` API 实时拉日志（解决 elevated mihomo stdout 不可重定向）
-  - PyInstaller spec + Inno Setup `installer.iss`：installer 自带 mihomo.exe，用户可选安装路径 + 桌面快捷方式
-  - 测试：smoke / yaml parity / proxy lifecycle / live runner 四套全过
-- 🚀 下版本（1.1.0）：把 Windows installer 加进 Releases；release 流程见 `docs/RELEASE.md`
+- ✅ macOS 1.1.8 工程完成（DMG 已打包，待 push + release）
+- ⚠️ **Windows 1.1.8 的「识别本机机场客户端进程」尚未在 Windows 真机验证**——core 代码同名 API
+  已在 `core/_windows.py` 里（`list_airport_client_families`、`detect_first_hop_processes`
+  含 SOCKS5 探测兜底），需要在真机上测：
+  1. **真机环境**：装 1.1.7 或更早版本，并行跑一个 Windows 机场客户端（FastLink Windows /
+     Mihomo Party / Clash Verge / Karing）。从仓库根 `bash scripts/build_windows.ps1` 重新打包。
+  2. **核心场景验证**：第一跳指向 `127.0.0.1:<airport-port>`，开 TUN 模式，点节点页的
+     **「识别本机机场客户端进程」**。预期：弹一个对话框列出按品牌分组的家族（FastLink /
+     Karing / Clash Verge ...），用户选一个后只把那一族的进程名加进 `first_hop_process_names`。
+  3. **Windows 特殊点**：
+     - `_listening_pid_powershell` / `_listening_pid_netstat` 在管理员下能看到 SYSTEM 的
+       socket，所以 SOCKS5 兜底仅在权限不足时才触发（macOS 是 root listener 看不到）。
+     - 进程名有 `.exe` 后缀（`mihomo.exe` 等），patterns 已用 `^mihomo$` 这类锚定，需要
+       考虑 patterns 是否吞 `.exe`。运行 `python tests\test_new_helpers.py` 应当全过。
+     - PyInstaller 需要把 `core/` 当包打进 EXE，`scripts/chainproxy_windows.spec` 已经处理。
+  4. **预期回归**：YAML parity 测试 + new_helpers 测试 + node_editor_tun 测试 都过。
+- 🚀 历史发布：1.0.1（macOS 首发） → 1.1.0–1.1.6（多版本 Win/Mac 同步） → 1.1.7（GeoIP
+  bundle + auto-detect button） → 1.1.8（**新**：brand-grouped chooser、SOCKS5 探测兜底、
+  helper 版本号修复、`<defunct>` 过滤、配置 `.bak` 备份）
+
+## 1.1.8 改动清单（核心）
+
+- **brand-grouped airport-client detection**：`core/_common.py::AIRPORT_BRANDS` + `airport_brand_for_name`，
+  支持 FastLink / Karing / Clash Verge / Mihomo Party / Surge / V2RayU/N/NG / NekoBox /
+  Stash / Shadowrocket / Quantumult X / Pluto + 通用 mihomo / sing-box / v2ray / xray /
+  hysteria / trojan / shadowsocks。
+- **SOCKS5 握手兜底**：`socks5_handshake_succeeds()`，绕开 root/SYSTEM listener 不可见的
+  限制；`detect_first_hop_processes` 在 lsof/netstat 找不到 PID 时若 SOCKS5 通就走 ps -A
+  按品牌枚举，单家族直接返回，多家族返回 `[]`，让 GUI 调 `list_airport_client_families`
+  弹选项让用户挑。
+- **helper 版本号同步修复（致命修复！）**：之前 `HELPER_VERSION` Python 常量改了但 bash
+  HELPER_SCRIPT 字面里的 `# version: N` 没对齐，导致每次启动都重装、每次都要输密码。
+- **`<defunct>` 过滤**：`_clean_proc_name` 过滤 `<defunct>` / `(spinning)` 等 ps 噪音，
+  避免 `PROCESS-NAME,<defunct>,DIRECT` 进规则。
+- **配置自动备份**：`save_config` 在写入前把上一份完好的 `config.json` 拷到 `.bak`，前提
+  是 `first_hops`/`second_hops` 都非空（避免覆盖一个 known-good backup）。
+- **节点 add/dup/rename/del 触发 mihomo 重启**：之前重命名节点 mihomo.yaml 不重新生成，
+  导致 URL 测试显示老节点名。现在统一调 `maybe_restart_for_config_change`。
+- **TUN 冲突检测加 IFF_UP 校验**：之前误把自己 down 但残留 IP 的 utun 当成另一个 TUN 软件。
+- **诊断 trace**：`runtime/tail-debug.log` 记录 tail 的 START/EXIT/IDLE/REOPEN 事件 +
+  GUI 的 stop()/start() 调用栈，方便日后排"日志卡住"类问题。
+
+## 注意事项（来自 2026-05-09 调试经验）
+
+- **不要 SIGTERM 用户正在跑的 ChainProxy 来发新版本**——用户的 NodeEditor 草稿（QLineEdit 里
+  没失焦的字段）会被一并杀掉。应该让用户自己关 .app 或者用 osascript quit。如果非要部署，
+  优先 build DMG + 让用户自己装。
+- **重命名节点必须触发 mihomo 重启**——否则 yaml 没更新，URL 测试会一直显示老节点名。所有
+  结构性 cfg 改动（add/dup/rename/del）都要调 `maybe_restart_for_config_change`。
 
 ## 给 Claude 的工作约定
 

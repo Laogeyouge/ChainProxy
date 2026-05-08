@@ -7,7 +7,7 @@
 ; The version is read from the AppVersion define below; bump it at release time.
 
 #define MyAppName        "ChainProxy"
-#define MyAppVersion     "1.1.7"
+#define MyAppVersion     "1.1.8"
 #define MyAppPublisher   "Laogeyouge"
 #define MyAppURL         "https://github.com/Laogeyouge/ChainProxy"
 #define MyAppExeName     "ChainProxy.exe"

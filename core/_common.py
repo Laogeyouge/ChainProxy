@@ -176,10 +176,34 @@ def save_config(cfg, config_path: Path, support_dir: Path):
     # overwrite the other's state mid-flight even with atomic rename,
     # because the in-memory `cfg` snapshot was lost.
     with _save_lock:
-        atomic_write_text(
-            config_path,
-            json.dumps(cfg, indent=2, ensure_ascii=False),
-        )
+        # Defensive backup: keep a rolling copy of the LAST successfully-
+        # saved file at config.json.bak. If a future save ever wipes the
+        # second-hop list (or anything else valuable) the user has a
+        # mechanical fallback they can restore by hand. We only refresh
+        # the .bak if the about-to-be-written content actually has
+        # populated `first_hops`/`second_hops` — that way a transient
+        # save with empty lists (mid-construction) can never overwrite
+        # a known-good backup with a known-bad one.
+        new_text = json.dumps(cfg, indent=2, ensure_ascii=False)
+        try:
+            if (cfg.get("first_hops") and cfg.get("second_hops")
+                    and config_path.exists()):
+                bak = config_path.with_name(config_path.name + ".bak")
+                # Only copy if the existing file ALSO had populated hops
+                # (otherwise we'd shadow a good backup with the empty
+                # state we're about to overwrite).
+                try:
+                    prev = json.loads(
+                        config_path.read_text(encoding="utf-8"))
+                    if prev.get("first_hops") and prev.get("second_hops"):
+                        bak.write_text(
+                            config_path.read_text(encoding="utf-8"),
+                            encoding="utf-8")
+                except (OSError, ValueError):
+                    pass
+        except OSError:
+            pass
+        atomic_write_text(config_path, new_text)
 
 
 def download_rule_set(rs, ruleset_dir: Path, timeout=20):
@@ -516,6 +540,132 @@ def tcp_reachable(host, port, timeout=2.0):
             return True
     except OSError:
         return False
+
+
+def socks5_handshake_succeeds(host, port, timeout=0.4):
+    """Probe whether `host:port` speaks SOCKS5 NoAuth.
+
+    Why we need this beyond `tcp_reachable`: airport clients like FastLink /
+    Mihomo Party / Clash Verge spawn their proxy core under root. macOS
+    `lsof` without sudo can only see sockets owned by the calling user, so
+    we cannot identify the listener PID directly — but a TCP connect to
+    127.0.0.1 is unrestricted regardless of the listener's UID. A successful
+    SOCKS5 handshake therefore proves "a real proxy is here" even when we
+    cannot see the PID, and we can fall back to a process-name scan to
+    populate the TUN whitelist.
+
+    Sends `\\x05\\x01\\x00` (one auth method offered: NoAuth) and expects
+    `\\x05\\x00`. Anything else (HTTP-only listener, kernel reset, timeout)
+    counts as failure. Mixed-port mihomo / Clash / sing-box / xray all
+    respond `\\x05\\x00`, which covers ~every airport client in practice.
+    """
+    try:
+        s = socket.create_connection((host, int(port)), timeout=timeout)
+    except OSError:
+        return False
+    try:
+        s.settimeout(timeout)
+        s.sendall(b"\x05\x01\x00")
+        data = s.recv(2)
+        return data == b"\x05\x00"
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+# Process-name patterns we trust to identify "this is an airport-client or
+# its proxy core". Used as a fallback when lsof can't see the listener (root
+# UID) but a SOCKS5 handshake succeeds.
+#
+# Patterns are grouped by BRAND so the GUI can present families to the user.
+# Many airport clients ship a GUI process AND a separately-launched proxy
+# core (Karing's GUI vs its root-mode system-extension service; FastLink's
+# GUI vs AtlasCore; Clash Verge's GUI vs verge-mihomo) — these may not be
+# linked by parent-PID (system-extension services have PPID=1) but they're
+# clearly the same product. Brand-grouping makes the chooser dialog show
+# "Karing" / "FastLink" / "Clash Verge" instead of pseudo-families based on
+# accidental process-tree shape.
+#
+# Order matters: more specific brand patterns appear first so a name like
+# `verge-mihomo` matches "Clash Verge" rather than the generic "mihomo"
+# at the bottom of the list.
+#
+# Match is case-insensitive on the basename of `comm`. Patterns err on the
+# inclusive side: a TUN whitelist that contains a non-proxy process is
+# harmless (just routes its traffic DIRECT), but missing the actual proxy
+# core deadlocks the chain. Add brands as users report them.
+AIRPORT_BRANDS = [
+    # (label, [regex patterns])
+    ("FastLink",      [r"FastLink", r"AtlasCore"]),
+    ("Clash Verge",   [r"clash[-_ ]?verge", r"verge[-_]mihomo"]),
+    ("Karing",        [r"^Karing$", r"karingService", r"karing"]),
+    ("Mihomo Party",  [r"mihomo[-_ ]?party"]),
+    ("ClashX",        [r"^ClashX", r"^clashx"]),
+    ("Clash.Meta",    [r"clash[-_ ]?meta"]),
+    ("FlClash",       [r"FlClash", r"^flclash"]),
+    ("V2RayU",        [r"v2rayu"]),
+    ("V2RayN",        [r"v2rayn"]),
+    ("V2RayNG",       [r"v2rayng"]),
+    ("NekoBox",       [r"nekobox", r"NekoRay"]),
+    ("Surge",         [r"^Surge", r"^sgw$"]),
+    ("Stash",         [r"^Stash$"]),
+    ("Quantumult X",  [r"quantumult"]),
+    ("Pluto",         [r"^Pluto"]),
+    ("Shadowrocket",  [r"shadowrocket"]),
+    # Generic Chinese-named airport clients (catch-all by suffix)
+    ("airport (机场)", [r"机场"]),
+    # Bare proxy cores running standalone (no branded GUI parent matched).
+    # Listed last so a branded match wins over a generic one.
+    ("mihomo",        [r"^mihomo$"]),
+    ("sing-box",      [r"sing[-_]?box"]),
+    ("v2ray",         [r"^v2ray$"]),
+    ("xray",          [r"^xray$"]),
+    ("hysteria",      [r"hysteria"]),
+    ("trojan",        [r"^trojan"]),
+    ("shadowsocks",   [r"^shadowsocks"]),
+]
+# Pre-compile for hot-path matching.
+_BRAND_RE = [(label, [re.compile(p, re.IGNORECASE) for p in pats])
+             for label, pats in AIRPORT_BRANDS]
+
+# Process names we never want in the whitelist even if a parent matched.
+# Adding a shell to PROCESS-NAME would route every command-line invocation
+# DIRECT, which is not what the user wants.
+_NEVER_WHITELIST = {
+    "launchd", "init", "kernel_task", "bash", "zsh", "sh", "fish",
+    "login", "terminal", "iterm2", "iterm", "tmux", "screen",
+    "python", "python3", "ruby", "node",
+    "explorer.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+    "conhost.exe", "wininit.exe", "csrss.exe", "services.exe",
+    "svchost.exe", "lsass.exe", "winlogon.exe",
+}
+
+
+def airport_brand_for_name(name):
+    """Return the brand label (e.g. 'FastLink', 'Karing', 'Clash Verge')
+    matching this process name, or None if no pattern matches."""
+    if not name:
+        return None
+    for label, regexes in _BRAND_RE:
+        for r in regexes:
+            if r.search(name):
+                return label
+    return None
+
+
+def name_looks_like_airport_client(name):
+    """Return True if `name` (a process basename) matches any of the
+    well-known airport-client / proxy-core brands."""
+    return airport_brand_for_name(name) is not None
+
+def name_should_skip(name):
+    if not name:
+        return True
+    return name.lower() in _NEVER_WHITELIST
 
 
 def test_url_through_proxy(url, local_port, log_path, curl_devnull,

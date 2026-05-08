@@ -242,6 +242,85 @@ def _children_names(pid):
     return names
 
 
+def _ps_snapshot_win():
+    """Return list[(pid, ppid, name)] for every process. Empty on error."""
+    out = _ps_run(
+        "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+        "ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, $_.ParentProcessId, $_.Name }"
+    )
+    procs = []
+    for line in (out or "").splitlines():
+        parts = line.strip().split("|", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        name = parts[2]
+        if name:
+            procs.append((pid, ppid, name))
+    return procs
+
+
+def list_airport_client_families():
+    """See _macos.list_airport_client_families_mac — same contract.
+
+    Windows-side groups by brand pattern (FastLink / Clash Verge / Karing /
+    ...) too, since Windows airport clients also ship products where the
+    GUI .exe and proxy-core .exe aren't parent-child (the proxy core is
+    sometimes spawned by a Windows service running under SYSTEM).
+    """
+    procs = _ps_snapshot_win()
+    if not procs:
+        return []
+
+    name_of = {pid: name for pid, _, name in procs}
+    children = {}
+    for pid, ppid, _ in procs:
+        children.setdefault(ppid, []).append(pid)
+
+    by_brand = {}
+    for pid, ppid, name in procs:
+        brand = _common.airport_brand_for_name(name)
+        if brand:
+            by_brand.setdefault(brand, []).append((pid, ppid, name))
+    if not by_brand:
+        return []
+
+    families = []
+    for brand, members in by_brand.items():
+        all_pids = set()
+        for pid, ppid, _ in members:
+            all_pids.add(pid)
+            parent_name = name_of.get(ppid)
+            if (ppid and ppid > 4 and parent_name
+                    and not _common.name_should_skip(parent_name)):
+                all_pids.add(ppid)
+                for cpid in children.get(ppid, []):
+                    all_pids.add(cpid)
+            for cpid in children.get(pid, []):
+                all_pids.add(cpid)
+
+        names = []
+        seen = set()
+        for pid in all_pids:
+            name = name_of.get(pid)
+            if not name or _common.name_should_skip(name):
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+        if names:
+            families.append({"label": brand, "names": names})
+
+    families.sort(key=lambda f: f["label"].lower())
+    return families
+
+
 def detect_first_hop_processes(host, port):
     """Given a (host, port) of a local first hop, return a deduplicated list
     of .exe names that should be added to first_hop_process_names so TUN
@@ -252,38 +331,55 @@ def detect_first_hop_processes(host, port):
     if host not in ("127.0.0.1", "localhost", "::1"):
         return []
     pid = _listening_pid_powershell(port) or _listening_pid_netstat(port)
-    if not pid:
+    if pid:
+        names = []
+        seen = set()
+
+        def push(name):
+            if not name:
+                return
+            # Normalize case for dedup but preserve user-facing case.
+            key = name.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            names.append(name)
+
+        self_name, ppid = _proc_info(pid)
+        push(self_name)
+        if ppid and ppid > 4:  # 0/4 = System idle / System
+            parent_name, _ = _proc_info(ppid)
+            # Skip well-known shell parents — they're not the airport client.
+            if parent_name and parent_name.lower() not in (
+                    "explorer.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+                    "wininit.exe", "services.exe", "svchost.exe"):
+                push(parent_name)
+                # When parent is the GUI, also pick up its other children
+                # (sibling proxy engines that aren't the listening process).
+                for n in _children_names(ppid):
+                    push(n)
+        # And our own children, in case THIS process is the GUI launcher.
+        for n in _children_names(pid):
+            push(n)
+        return names
+
+    # netstat/Get-NetTCPConnection saw nobody. Same blind-spot as macOS:
+    # listeners under SYSTEM (mihomo started via a privileged helper) or
+    # other security contexts can be invisible to a non-elevated query. A
+    # SOCKS5 handshake via 127.0.0.1 is unrestricted, so use it to confirm
+    # the proxy exists, then enumerate plausible airport-client processes
+    # by name.
+    if not _common.socks5_handshake_succeeds(host, port):
         return []
-    names = []
-    seen = set()
-
-    def push(name):
-        if not name:
-            return
-        # Normalize case for dedup but preserve user-facing case.
-        key = name.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        names.append(name)
-
-    self_name, ppid = _proc_info(pid)
-    push(self_name)
-    if ppid and ppid > 4:  # 0/4 = System idle / System
-        parent_name, _ = _proc_info(ppid)
-        # Skip well-known shell parents — they're not the airport client.
-        if parent_name and parent_name.lower() not in (
-                "explorer.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
-                "wininit.exe", "services.exe", "svchost.exe"):
-            push(parent_name)
-            # When parent is the GUI, also pick up its other children
-            # (sibling proxy engines that aren't the listening process).
-            for n in _children_names(ppid):
-                push(n)
-    # And our own children, in case THIS process is the GUI launcher.
-    for n in _children_names(pid):
-        push(n)
-    return names
+    families = list_airport_client_families()
+    if not families:
+        return []
+    if len(families) == 1:
+        return families[0]["names"]
+    # Multiple airport clients running. Caller (GUI) should disambiguate via
+    # list_airport_client_families() so the user picks the right one rather
+    # than getting an over-broad whitelist (the v1.1.7 bug we hit).
+    return []
 
 
 def test_url_through_proxy(url, local_port, log_path, timeout=15,
@@ -926,18 +1022,50 @@ class MihomoRunner:
         """Stream mihomo's log to log_cb until the process dies or the GUI
         explicitly asks us to stop. If the process dies WITHOUT the GUI
         asking (`_stop_tail` not set), fire on_unexpected_exit so the GUI
-        can auto-restart. Same contract as the macOS MihomoRunner._tail."""
+        can auto-restart. Same contract as the macOS MihomoRunner._tail.
+
+        Re-stat the path on every idle iteration: log rotation
+        (`_rotate_log_if_large` runs on every start) renames mihomo.log →
+        mihomo.log.1; without re-stat the tail's fd points at the
+        now-quiescent renamed file forever and the user sees the log
+        panel freeze. Detects rotation via st_ino mismatch on the path
+        and truncation via size going backwards.
+        """
+        f = None
         try:
-            with open(MIHOMO_LOG, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(0, 2)
-                while not self._stop_tail.is_set() and self.is_running():
-                    line = f.readline()
-                    if not line:
-                        time.sleep(0.3)
-                        continue
-                    self.log_cb(line.rstrip())
+            f = open(MIHOMO_LOG, "r", encoding="utf-8", errors="replace")
+            f.seek(0, 2)
+            cur_inode = os.fstat(f.fileno()).st_ino
+            cur_size = f.tell()
+            while not self._stop_tail.is_set() and self.is_running():
+                try:
+                    st = os.stat(MIHOMO_LOG)
+                    if st.st_ino != cur_inode or st.st_size < cur_size:
+                        try:
+                            f.close()
+                        except OSError:
+                            pass
+                        f = open(MIHOMO_LOG, "r",
+                                 encoding="utf-8", errors="replace")
+                        cur_inode = os.fstat(f.fileno()).st_ino
+                        cur_size = 0
+                except FileNotFoundError:
+                    time.sleep(0.3)
+                    continue
+                line = f.readline()
+                if not line:
+                    time.sleep(0.3)
+                    continue
+                cur_size = f.tell()
+                self.log_cb(line.rstrip())
         except Exception:
             pass
+        finally:
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
         if not self._stop_tail.is_set() and self.on_unexpected_exit:
             try:
                 self.on_unexpected_exit()
@@ -1016,6 +1144,7 @@ __all__ = [
     "update_all_rule_sets", "rule_set_local_path_exists",
     "build_mihomo_yaml", "proxy_to_mihomo", "find_mihomo",
     "seed_geodata", "detect_first_hop_processes",
+    "list_airport_client_families",
     "tcp_reachable", "test_url_through_proxy",
     "set_system_proxy", "panic_recover", "bounce_primary_interface",
     "refresh_system_proxy",

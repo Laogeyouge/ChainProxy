@@ -25,11 +25,11 @@ from PyQt6.QtGui import (QAction, QColor, QFont, QFontMetrics, QIcon,
                           QPen, QShortcut)
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFrame, QGridLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QStackedWidget, QStyle, QStyledItemDelegate, QSystemTrayIcon,
-    QTableWidget, QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout,
-    QWidget,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+    QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QStyle,
+    QStyledItemDelegate, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
+    QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 import chainproxy_core as core
@@ -1092,6 +1092,7 @@ class NodeEditor(QFrame):
         core.save_config(self.app.cfg)
         self.refresh()
         self.app.on_config_change()
+        self.app.maybe_restart_for_config_change(silent=True)
         self.app.toast(f"已新增节点：{name}")
 
     def _dup(self):
@@ -1112,6 +1113,7 @@ class NodeEditor(QFrame):
         core.save_config(self.app.cfg)
         self.refresh()
         self.app.on_config_change()
+        self.app.maybe_restart_for_config_change(silent=True)
         self.app.toast(f"已复制为：{name}")
 
     def _rename(self):
@@ -1132,6 +1134,7 @@ class NodeEditor(QFrame):
         core.save_config(self.app.cfg)
         self.refresh()
         self.app.on_config_change()
+        self.app.maybe_restart_for_config_change(silent=True)
         self.app.toast(f"已重命名为：{name}")
 
     def _del(self):
@@ -1150,6 +1153,7 @@ class NodeEditor(QFrame):
         core.save_config(self.app.cfg)
         self.refresh()
         self.app.on_config_change()
+        self.app.maybe_restart_for_config_change(silent=True)
         self.app.toast(f"已删除：{cur}")
 
     def _auto_detect_processes(self):
@@ -1179,12 +1183,42 @@ class NodeEditor(QFrame):
             return
         names = core.detect_first_hop_processes(host, port)
         if not names:
-            QMessageBox.information(
-                self, "未检测到进程",
-                f"端口 {port} 当前没有监听进程。\n\n"
-                "请先打开你的机场客户端（FastLink / Clash Verge / v2rayN…），"
-                "确认它已在该端口启动 SOCKS5 / HTTP 代理后再点一次。")
-            return
+            # detect_first_hop_processes returns [] in two cases:
+            #   (a) genuinely nothing listening / not SOCKS5
+            #   (b) listener is invisible to user-level lsof AND multiple
+            #       airport-client families are running (we refused to guess)
+            # Disambiguate by asking the platform for the family list.
+            families = (core.list_airport_client_families()
+                        if hasattr(core, "list_airport_client_families")
+                        else [])
+            if not families:
+                QMessageBox.information(
+                    self, "未检测到进程",
+                    f"端口 {port} 当前没有监听进程。\n\n"
+                    "请先打开你的机场客户端（FastLink / Clash Verge / v2rayN…），"
+                    "确认它已在该端口启动 SOCKS5 / HTTP 代理后再点一次。")
+                return
+            # Multi-family case: ask the user which one is actually serving
+            # this port. Keep the labels human-readable and include the
+            # member list as a hint so the user can tell families apart even
+            # if their main label is unfamiliar.
+            items = [
+                f"{f['label']}（{','.join(f['names'])}）" for f in families
+            ]
+            chosen, ok = QInputDialog.getItem(
+                self, "请选择机场客户端",
+                f"在端口 {port} 上检测到 SOCKS5 代理，但本机有多个机场客户端"
+                f"在跑，无法自动判断是哪一个。请选一个：",
+                items, 0, False)
+            if not ok or not chosen:
+                return
+            names = families[items.index(chosen)]["names"]
+        # Sanitize: drop zombie/synthetic names that ps may produce
+        # (`<defunct>`, `(spinning)`). Belt-and-suspenders for whatever
+        # the core layer returned.
+        names = [n for n in names
+                 if n and n.strip() and not n.startswith("<")
+                 and not n.startswith("(")]
         existing = list(self.app.cfg.get("first_hop_process_names") or [])
         existing_lower = {n.lower() for n in existing}
         new_names = [n for n in names if n.lower() not in existing_lower]
@@ -2125,6 +2159,31 @@ class MainWindow(QMainWindow):
         ts = time.strftime("%H:%M:%S")
         self.log_signal.emit(f"[{ts}] {msg}")
 
+    def _trace_lifecycle(self, where: str, **fields):
+        """Append a one-line lifecycle event to runtime/tail-debug.log.
+
+        Each entry includes the current stack (3 frames up) so we can tell
+        WHO called stop()/start() — user click vs debounced restart vs
+        watchdog auto-restart vs exit cleanup. Combined with the runner's
+        per-tail trace, this gives a definitive timeline for every kill.
+        """
+        try:
+            import traceback
+            stack = traceback.extract_stack()[-5:-1]
+            callers = " -> ".join(
+                f"{f.name}:{f.lineno}" for f in stack)
+            details = " ".join(f"{k}={v}" for k, v in fields.items())
+            ts = time.strftime("%H:%M:%S")
+            with open(core.RUNTIME_DIR / "tail-debug.log", "a",
+                      encoding="utf-8") as df:
+                df.write(
+                    f"[{ts}] GUI {where} "
+                    f"intentional_stop={self._intentional_stop} "
+                    f"runner_running={self.runner.is_running()} "
+                    f"{details} via [{callers}]\n")
+        except Exception:
+            pass
+
     def _on_log_signal(self, line):
         self.overview.append_log(line)
 
@@ -2364,10 +2423,28 @@ class MainWindow(QMainWindow):
                     ["/sbin/ifconfig", u],
                     capture_output=True, text=True, timeout=1,
                 )
-                if "198.18.0.1" in r.stdout:
-                    owners.append(u)
             except Exception:
                 continue
+            out = r.stdout
+            if "198.18.0.1" not in out:
+                continue
+            # Require IFF_UP. macOS keeps the IP attached on a utun for a
+            # while after `ifconfig <utun> down` (our helper's cleanup_utun
+            # only downs the interface, not the address), so without this
+            # check our own dead-but-not-yet-reaped utun trips the
+            # detection and shows a phantom "another TUN is fighting us"
+            # warning during normal restart cycles. ifconfig prints the
+            # decoded flag set as `flags=8051<UP,POINTOPOINT,RUNNING,...>`;
+            # parse the names-in-angles to avoid hard-coding bit values.
+            first_line = (out.splitlines() or [""])[0]
+            tokens = set()
+            if "<" in first_line and ">" in first_line:
+                tokens = {t.strip() for t in
+                          first_line[first_line.find("<")+1:first_line.find(">")]
+                          .split(",")}
+            if "UP" not in tokens:
+                continue
+            owners.append(u)
         if len(owners) > 1:
             self._foreign_tun_warned_at = now
             others = ", ".join(owners[1:])
@@ -2468,6 +2545,7 @@ class MainWindow(QMainWindow):
     def start(self, silent: bool = False):
         """Start mihomo. With silent=True, errors go to log/toast instead of modals
         — used by the debounced auto-restart."""
+        self._trace_lifecycle("MainWindow.start", silent=silent)
         def fail(title: str, msg: str, critical: bool = False):
             if silent:
                 self.log(f"✗ {title}: {msg}")
@@ -2521,6 +2599,13 @@ class MainWindow(QMainWindow):
                         fh["server"], int(fh["port"]))
                 except Exception:
                     detected = []
+            # Belt-and-suspenders sanitization: the platform layer should
+            # already reject names like `<defunct>`, but also strip them
+            # at the GUI write site so a future regression in detection
+            # doesn't poison the on-disk whitelist.
+            detected = [n for n in detected
+                        if n and n.strip() and not n.startswith("<")
+                        and not n.startswith("(")]
             if detected:
                 self.cfg["first_hop_process_names"] = list(detected)
                 core.save_config(self.cfg)
@@ -2661,6 +2746,12 @@ class MainWindow(QMainWindow):
         # a phantom auto-restart or, in the other order, silently swallow
         # a real crash that happened to land during a stop.
         self._intentional_stop = True
+        # Diagnostic trace: stop() can be called from many sites (toggle
+        # click, debounced config restart, watchdog auto-restart, panic
+        # recover, post-wake recover, exit cleanup). Inspecting the call
+        # stack lets us tell which fired in tail-debug.log post-incident.
+        self._trace_lifecycle(
+            "MainWindow.stop", cancel_pending_restart=cancel_pending_restart)
         try:
             self.runner.stop()
         except Exception as e:

@@ -110,6 +110,71 @@ assert hasattr(core, "seed_geodata"), "core.seed_geodata missing"
 assert hasattr(core, "BUNDLED_GEODATA_DIR"), "core.BUNDLED_GEODATA_DIR missing"
 print("[helpers] core surface includes new symbols: OK")
 
+# 9. socks5_handshake_succeeds returns True for a fake SOCKS5 server,
+#    False for a plain TCP listener / non-SOCKS5 service. Crucial because
+#    the fallback path (root-owned listener detection) hinges on this probe.
+import threading  # noqa: E402
+
+def _fake_socks5_server(host="127.0.0.1"):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind((host, 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def serve():
+        try:
+            conn, _ = srv.accept()
+            conn.settimeout(1.0)
+            try:
+                hello = conn.recv(3)
+                if hello == b"\x05\x01\x00":
+                    conn.sendall(b"\x05\x00")
+                else:
+                    conn.sendall(b"\x05\xff")
+            finally:
+                conn.close()
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return port
+
+socks5_port = _fake_socks5_server()
+assert common.socks5_handshake_succeeds("127.0.0.1", socks5_port, timeout=1.0), \
+    "SOCKS5 server should respond to handshake"
+print("[helpers] socks5_handshake_succeeds on real SOCKS5: OK")
+
+plain = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+plain.bind(("127.0.0.1", 0))
+plain.listen(1)
+plain_port = plain.getsockname()[1]
+try:
+    assert not common.socks5_handshake_succeeds("127.0.0.1", plain_port, timeout=0.5), \
+        "plain TCP listener should fail SOCKS5 probe (no server response)"
+    print("[helpers] socks5_handshake_succeeds rejects plain TCP: OK")
+finally:
+    plain.close()
+
+# 10. Process-name patterns identify common airport clients but skip shells.
+assert common.name_looks_like_airport_client("FastLink机场")
+assert common.name_looks_like_airport_client("AtlasCore_arm64")
+assert common.name_looks_like_airport_client("clash-verge")
+assert common.name_looks_like_airport_client("verge-mihomo")
+assert common.name_looks_like_airport_client("mihomo")
+assert common.name_looks_like_airport_client("ClashX Pro")
+assert common.name_looks_like_airport_client("Mihomo Party")
+assert common.name_looks_like_airport_client("v2rayN.exe")
+assert not common.name_looks_like_airport_client("python3")
+assert not common.name_looks_like_airport_client("WeChat")
+assert not common.name_looks_like_airport_client("")
+assert common.name_should_skip("bash")
+assert common.name_should_skip("python3")
+assert common.name_should_skip("EXPLORER.EXE")
+assert not common.name_should_skip("FastLink机场")
+print("[helpers] airport-client name patterns: OK")
+
 # Cleanup
 import shutil  # noqa: E402
 shutil.rmtree(_TMP, ignore_errors=True)

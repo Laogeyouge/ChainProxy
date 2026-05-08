@@ -56,9 +56,14 @@ BUNDLED_GEODATA_DIR = _find_bundled_geodata_dir()
 # ---------- helper-script for TUN privilege ----------
 HELPER_PATH = "/usr/local/bin/chainproxy-helper.sh"
 SUDOERS_PATH = "/etc/sudoers.d/chainproxy"
-HELPER_VERSION = "8"
+HELPER_VERSION = "10"
+# Keep the literal `# version: N` line below in sync with HELPER_VERSION above.
+# helper_installed() reads the installed file and looks for "version: <N>" to
+# decide whether a reinstall is needed; if the literal here doesn't match the
+# Python constant, every start writes a "stale" file that fails the next check
+# and the user is prompted for sudo on every launch (infinite reinstall loop).
 HELPER_SCRIPT = r"""#!/bin/bash
-# version: 8
+# version: 10
 # ChainProxy mihomo helper. Managed by ChainProxy.app — DO NOT EDIT.
 # Args: <runtime-dir> <action: start|stop|status|recover|flush-dns|bounce-iface> [yaml-path]
 set -e
@@ -367,6 +372,26 @@ def _listening_pid_lsof(port):
     return loopback_pid or pid
 
 
+def _clean_proc_name(comm):
+    """Reject process names that aren't real executable basenames.
+
+    macOS `ps` prints `<defunct>` for zombie processes whose parent hasn't
+    reaped them. Earlier the auto-detect path slurped that into
+    `first_hop_process_names`, producing `PROCESS-NAME,<defunct>,DIRECT` —
+    inert in mihomo but ugly in the GUI's whitelist label and a footgun
+    for anyone diffing config.json. Reject any name that starts with `<`,
+    `(`, or is empty/whitespace; let real names through unchanged.
+    """
+    if not comm:
+        return None
+    s = comm.strip()
+    if not s:
+        return None
+    if s.startswith("<") or s.startswith("("):
+        return None
+    return s
+
+
 def _proc_info_mac(pid):
     """Return (process name, parent PID) for `pid`, or (None, None)."""
     try:
@@ -383,12 +408,13 @@ def _proc_info_mac(pid):
     parts = line.rsplit(None, 1)
     if len(parts) != 2 or not parts[1].isdigit():
         return (None, None)
-    comm = os.path.basename(parts[0])
-    return (comm or None, int(parts[1]))
+    comm = _clean_proc_name(os.path.basename(parts[0]))
+    return (comm, int(parts[1]))
 
 
 def _children_names_mac(pid):
-    """Return basename of every process whose PPID == pid."""
+    """Return basename of every (live) process whose PPID == pid.
+    Filters out `<defunct>` zombies — see _clean_proc_name."""
     try:
         r = subprocess.run(
             ["ps", "-A", "-o", "pid=,ppid=,comm="],
@@ -407,42 +433,172 @@ def _children_names_mac(pid):
             continue
         if ppid != int(pid):
             continue
-        names.append(os.path.basename(parts[2]))
+        clean = _clean_proc_name(os.path.basename(parts[2]))
+        if clean:
+            names.append(clean)
     return names
+
+
+def _ps_snapshot_mac():
+    """Return list[(pid, ppid, basename)] for every LIVE process. Zombies
+    (`<defunct>`) and other non-real comm strings are filtered out via
+    _clean_proc_name; without this they leak into the airport-client
+    detection and end up as `PROCESS-NAME,<defunct>,DIRECT` in mihomo's
+    rule list. Empty on error."""
+    try:
+        r = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid=,comm="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return []
+    procs = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        bn = _clean_proc_name(os.path.basename(parts[2]))
+        if bn:
+            procs.append((pid, ppid, bn))
+    return procs
+
+
+def list_airport_client_families_mac():
+    """Return [{"label": str, "names": [str, ...]}, ...] — one entry per
+    distinct airport-client BRAND currently running.
+
+    Grouping is by brand pattern (Karing / FastLink / Clash Verge / ...) so
+    that products whose GUI and proxy-core are not parent-child (Karing's
+    GUI vs its system-extension service, both PPID=1) still cluster
+    correctly. Without sudo we cannot tell the SOCKS5 listener apart from
+    its PID (root-owned sockets are invisible to user-level lsof), so when
+    multiple brands are running the GUI must ask the user which one owns
+    the queried port.
+
+    A brand-matched process's parent is also pulled in IF the parent isn't
+    a generic shell — covers .app launcher binaries that don't themselves
+    contain a brand keyword. Children of brand-matched processes are also
+    pulled in (sibling proxy engines under the same .app).
+    """
+    procs = _ps_snapshot_mac()
+    if not procs:
+        return []
+
+    name_of = {pid: bn for pid, _, bn in procs}
+    children = {}
+    for pid, ppid, _ in procs:
+        children.setdefault(ppid, []).append(pid)
+
+    # Group brand-matched PIDs by brand label.
+    by_brand = {}
+    for pid, ppid, bn in procs:
+        brand = _common.airport_brand_for_name(bn)
+        if brand:
+            by_brand.setdefault(brand, []).append((pid, ppid, bn))
+    if not by_brand:
+        return []
+
+    families = []
+    for brand, members in by_brand.items():
+        all_pids = set()
+        for pid, ppid, _ in members:
+            all_pids.add(pid)
+            # Pull in the parent if it isn't launchd / a shell — captures
+            # .app launchers whose comm doesn't include a brand keyword.
+            parent_name = name_of.get(ppid)
+            if (ppid > 1 and parent_name
+                    and not _common.name_should_skip(parent_name)):
+                all_pids.add(ppid)
+                for cpid in children.get(ppid, []):
+                    all_pids.add(cpid)
+            for cpid in children.get(pid, []):
+                all_pids.add(cpid)
+
+        names = []
+        seen = set()
+        for pid in all_pids:
+            bn = name_of.get(pid)
+            if not bn or _common.name_should_skip(bn):
+                continue
+            key = bn.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(bn)
+        if names:
+            families.append({"label": brand, "names": names})
+
+    families.sort(key=lambda f: f["label"].lower())
+    return families
+
+
+# Public alias matching the Windows surface name. The platform-suffixed
+# function is kept for grep clarity inside this module; the GUI imports the
+# unsuffixed name from `core`.
+def list_airport_client_families():
+    return list_airport_client_families_mac()
 
 
 def detect_first_hop_processes(host, port):
-    """See _windows.detect_first_hop_processes — same contract."""
+    """See _windows.detect_first_hop_processes — same contract.
+
+    Tries lsof first (works when listener is owned by current user). On a
+    miss, falls back to a SOCKS5 handshake + airport-client process scan.
+    The fallback path returns names from a SINGLE family if exactly one is
+    running; if multiple distinct families are found, the GUI should call
+    `list_airport_client_families` and let the user disambiguate.
+    """
     if host not in ("127.0.0.1", "localhost", "::1"):
         return []
     pid = _listening_pid_lsof(port)
-    if not pid:
+    if pid:
+        names = []
+        seen = set()
+
+        def push(name):
+            if not name:
+                return
+            key = name.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            names.append(name)
+
+        self_name, ppid = _proc_info_mac(pid)
+        push(self_name)
+        if ppid and ppid > 1:  # 1 = launchd
+            parent_name, _ = _proc_info_mac(ppid)
+            # Skip launcher shells / launchd children — not the airport client.
+            if parent_name and parent_name.lower() not in (
+                    "launchd", "bash", "zsh", "sh", "login", "terminal"):
+                push(parent_name)
+                for n in _children_names_mac(ppid):
+                    push(n)
+        for n in _children_names_mac(pid):
+            push(n)
+        return names
+
+    # lsof saw nobody. Listener is likely root-owned (FastLink spawns
+    # AtlasCore as root, Clash Verge's verge-mihomo runs as root, etc.).
+    # SOCKS5 handshake confirms a real proxy is there; fall through to the
+    # name-pattern family scan.
+    if not _common.socks5_handshake_succeeds(host, port):
         return []
-    names = []
-    seen = set()
-
-    def push(name):
-        if not name:
-            return
-        key = name.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        names.append(name)
-
-    self_name, ppid = _proc_info_mac(pid)
-    push(self_name)
-    if ppid and ppid > 1:  # 1 = launchd
-        parent_name, _ = _proc_info_mac(ppid)
-        # Skip launcher shells / launchd children — not the airport client.
-        if parent_name and parent_name.lower() not in (
-                "launchd", "bash", "zsh", "sh", "login", "terminal"):
-            push(parent_name)
-            for n in _children_names_mac(ppid):
-                push(n)
-    for n in _children_names_mac(pid):
-        push(n)
-    return names
+    families = list_airport_client_families_mac()
+    if not families:
+        return []
+    if len(families) == 1:
+        return families[0]["names"]
+    # Multiple airport clients running. Be conservative: return [] so the
+    # caller (GUI) recognizes ambiguity and asks the user. Returning an
+    # over-broad union here was the bug that caused FastLink whitelists to
+    # accidentally include unrelated Clash Verge / Mihomo Party processes.
+    return []
 
 
 def test_url_through_proxy(url, local_port, log_path, timeout=15,
@@ -791,24 +947,56 @@ class MihomoRunner:
         """Stream mihomo's log to log_cb until either the process dies or
         the GUI explicitly asks us to stop. If the process dies WITHOUT
         the GUI asking (`_tail_stop` not set), fire on_unexpected_exit so
-        the GUI can auto-restart."""
+        the GUI can auto-restart.
+
+        Diagnostic trace lives in runtime/tail-debug.log — every life-cycle
+        event (start/exit/idle/break) appended so we can post-mortem when
+        the panel goes quiet without losing the simple legacy code path.
+        Per-line spam is avoided; trace points fire at most every 10s.
+        """
+        debug_path = RUNTIME_DIR / "tail-debug.log"
+
+        def trace(msg):
+            try:
+                with open(debug_path, "a", encoding="utf-8") as df:
+                    df.write(f"[{time.strftime('%H:%M:%S')}] "
+                             f"tid={threading.get_ident()} {msg}\n")
+            except OSError:
+                pass
+
+        opened_at = time.time()
+        last_line_at = opened_at
+        lines_seen = 0
         try:
             with open(MIHOMO_LOG, "r") as f:
                 f.seek(0, 2)
+                trace(f"START pos={f.tell()} sudo_pid={self.sudo_pid} "
+                      f"proc={self.proc.pid if self.proc else None}")
+                heartbeat_at = opened_at
                 while not self._tail_stop.is_set():
                     if not self.is_running():
+                        trace(f"BREAK is_running=False after {lines_seen} lines")
                         break
                     line = f.readline()
                     if not line:
+                        now = time.time()
+                        if now - heartbeat_at > 10:
+                            trace(f"IDLE lines={lines_seen} pos={f.tell()} "
+                                  f"since_last={now-last_line_at:.1f}s")
+                            heartbeat_at = now
                         time.sleep(0.3)
                         continue
+                    lines_seen += 1
+                    last_line_at = time.time()
                     self.log_cb(line.rstrip())
-        except Exception:
-            pass
-        # Distinguish "we asked it to stop" from "it died on us". Only
-        # the latter triggers auto-restart.
+                trace(f"LOOP_END lines={lines_seen} tail_stop={self._tail_stop.is_set()}")
+        except Exception as e:
+            trace(f"EXCEPTION {type(e).__name__}: {e}")
+        trace(f"EXIT lines={lines_seen} dur={time.time()-opened_at:.1f}s "
+              f"tail_stop={self._tail_stop.is_set()}")
         if not self._tail_stop.is_set() and self.on_unexpected_exit:
             try:
+                trace("FIRING on_unexpected_exit")
                 self.on_unexpected_exit()
             except Exception:
                 pass
@@ -862,6 +1050,7 @@ __all__ = [
     # mihomo + yaml
     "build_mihomo_yaml", "proxy_to_mihomo", "find_mihomo",
     "seed_geodata", "detect_first_hop_processes",
+    "list_airport_client_families",
     # network probes / tests
     "tcp_reachable", "test_url_through_proxy",
     # platform: system proxy / panic / runner / single instance
