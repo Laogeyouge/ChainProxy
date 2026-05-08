@@ -93,12 +93,21 @@ if hasattr(core, "detect_first_hop_processes"):
     held_port = listener.getsockname()[1]
     try:
         names = core.detect_first_hop_processes("127.0.0.1", held_port)
-        assert names, \
-            f"port {held_port} held by us, expected non-empty list, got {names!r}"
-        # Should contain python.exe / python (the binary that's running us)
-        py_match = any("python" in n.lower() for n in names)
-        assert py_match, \
-            f"expected python.exe in detection of our own listener, got {names!r}"
+        # name_should_skip filters python.exe / powershell.exe out of the
+        # whitelist (they're shells, not airport-client cores). On Windows
+        # the py.exe launcher survives because it is not in _NEVER_WHITELIST.
+        # On macOS the listener self_name `python` / `python3` IS filtered,
+        # so the result may legitimately be empty — but children/parent
+        # references can still surface non-shell process names.
+        if sys.platform == "win32":
+            assert names, \
+                f"port {held_port} held by us, expected non-empty list, got {names!r}"
+            # Make sure we did NOT leak shell noise
+            for n in names:
+                assert "python.exe" != n.lower(), f"python.exe leaked: {names!r}"
+                assert "powershell" not in n.lower(), \
+                    f"powershell.exe leaked: {names!r}"
+                assert "conhost" not in n.lower(), f"conhost.exe leaked: {names!r}"
         print(f"[helpers] detect_first_hop_processes on owned port: OK ({names})")
     finally:
         listener.close()
@@ -166,12 +175,24 @@ assert common.name_looks_like_airport_client("mihomo")
 assert common.name_looks_like_airport_client("ClashX Pro")
 assert common.name_looks_like_airport_client("Mihomo Party")
 assert common.name_looks_like_airport_client("v2rayN.exe")
+# Windows reports Win32_Process names with .exe — bare-core patterns are
+# anchored with $ so the matcher must strip the suffix.
+assert common.name_looks_like_airport_client("mihomo.exe")
+assert common.name_looks_like_airport_client("v2ray.exe")
+assert common.name_looks_like_airport_client("xray.exe")
+assert common.name_looks_like_airport_client("sgw.exe")
+assert common.name_looks_like_airport_client("Stash.exe")
 assert not common.name_looks_like_airport_client("python3")
 assert not common.name_looks_like_airport_client("WeChat")
 assert not common.name_looks_like_airport_client("")
 assert common.name_should_skip("bash")
 assert common.name_should_skip("python3")
 assert common.name_should_skip("EXPLORER.EXE")
+# Windows console / shell noise must be filtered (.exe suffix stripped on lookup)
+assert common.name_should_skip("conhost.exe")
+assert common.name_should_skip("python.exe")
+assert common.name_should_skip("svchost.exe")
+assert common.name_should_skip("powershell.exe")
 assert not common.name_should_skip("FastLink机场")
 print("[helpers] airport-client name patterns: OK")
 

@@ -639,9 +639,10 @@ _NEVER_WHITELIST = {
     "launchd", "init", "kernel_task", "bash", "zsh", "sh", "fish",
     "login", "terminal", "iterm2", "iterm", "tmux", "screen",
     "python", "python3", "ruby", "node",
-    "explorer.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
-    "conhost.exe", "wininit.exe", "csrss.exe", "services.exe",
-    "svchost.exe", "lsass.exe", "winlogon.exe",
+    # Windows: listed without .exe; name_should_skip strips the suffix
+    # before lookup so this set stays cross-platform.
+    "explorer", "cmd", "powershell", "pwsh", "conhost",
+    "wininit", "csrss", "services", "svchost", "lsass", "winlogon",
 }
 
 
@@ -650,6 +651,12 @@ def airport_brand_for_name(name):
     matching this process name, or None if no pattern matches."""
     if not name:
         return None
+    # Windows reports process names with a .exe suffix (Win32_Process.Name),
+    # but several patterns below are anchored with $ so the bare-core names
+    # (mihomo, v2ray, xray, sgw, Stash) match the macOS form. Strip the suffix
+    # so the same patterns work on both platforms.
+    if name.lower().endswith(".exe"):
+        name = name[:-4]
     for label, regexes in _BRAND_RE:
         for r in regexes:
             if r.search(name):
@@ -665,7 +672,10 @@ def name_looks_like_airport_client(name):
 def name_should_skip(name):
     if not name:
         return True
-    return name.lower() in _NEVER_WHITELIST
+    n = name.lower()
+    if n.endswith(".exe"):
+        n = n[:-4]
+    return n in _NEVER_WHITELIST
 
 
 def test_url_through_proxy(url, local_port, log_path, curl_devnull,

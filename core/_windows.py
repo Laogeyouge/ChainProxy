@@ -27,7 +27,7 @@ from ._common import (
     APP_NAME, PROTOCOLS, SS_CIPHERS, FAKE_GATEWAY, RULE_TARGETS,
     LOYALSOLDIER_BASE, DEFAULT_RULE_SETS, DEFAULT_CONFIG,
     proxy_to_mihomo, build_mihomo_yaml as _build_mihomo_yaml_raw,
-    tcp_reachable,
+    tcp_reachable, name_should_skip,
 )
 
 
@@ -336,7 +336,7 @@ def detect_first_hop_processes(host, port):
         seen = set()
 
         def push(name):
-            if not name:
+            if not name or _common.name_should_skip(name):
                 return
             # Normalize case for dedup but preserve user-facing case.
             key = name.lower()
@@ -349,10 +349,7 @@ def detect_first_hop_processes(host, port):
         push(self_name)
         if ppid and ppid > 4:  # 0/4 = System idle / System
             parent_name, _ = _proc_info(ppid)
-            # Skip well-known shell parents — they're not the airport client.
-            if parent_name and parent_name.lower() not in (
-                    "explorer.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
-                    "wininit.exe", "services.exe", "svchost.exe"):
+            if parent_name and not _common.name_should_skip(parent_name):
                 push(parent_name)
                 # When parent is the GUI, also pick up its other children
                 # (sibling proxy engines that aren't the listening process).
@@ -1144,7 +1141,7 @@ __all__ = [
     "update_all_rule_sets", "rule_set_local_path_exists",
     "build_mihomo_yaml", "proxy_to_mihomo", "find_mihomo",
     "seed_geodata", "detect_first_hop_processes",
-    "list_airport_client_families",
+    "list_airport_client_families", "name_should_skip",
     "tcp_reachable", "test_url_through_proxy",
     "set_system_proxy", "panic_recover", "bounce_primary_interface",
     "refresh_system_proxy",

@@ -18,7 +18,7 @@ from ._common import (  # re-exported as part of platform API
     APP_NAME, PROTOCOLS, SS_CIPHERS, FAKE_GATEWAY, RULE_TARGETS,
     LOYALSOLDIER_BASE, DEFAULT_RULE_SETS, DEFAULT_CONFIG,
     proxy_to_mihomo, build_mihomo_yaml as _build_mihomo_yaml_raw,
-    tcp_reachable,
+    tcp_reachable, name_should_skip,
 )
 
 # ---------- paths ----------
@@ -1050,7 +1050,7 @@ __all__ = [
     # mihomo + yaml
     "build_mihomo_yaml", "proxy_to_mihomo", "find_mihomo",
     "seed_geodata", "detect_first_hop_processes",
-    "list_airport_client_families",
+    "list_airport_client_families", "name_should_skip",
     # network probes / tests
     "tcp_reachable", "test_url_through_proxy",
     # platform: system proxy / panic / runner / single instance

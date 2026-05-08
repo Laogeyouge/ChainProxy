@@ -1219,15 +1219,31 @@ class NodeEditor(QFrame):
         names = [n for n in names
                  if n and n.strip() and not n.startswith("<")
                  and not n.startswith("(")]
-        existing = list(self.app.cfg.get("first_hop_process_names") or [])
+        existing_raw = list(self.app.cfg.get("first_hop_process_names") or [])
+        # Older ChainProxy builds (≤1.1.7) sometimes persisted shell/console
+        # noise (conhost.exe, svchost.exe, …) into the whitelist because the
+        # direct-PID detection branch wasn't filtering children. Strip any
+        # such residue now so re-running detect self-heals stale config.
+        skip = getattr(core, "name_should_skip", lambda _n: False)
+        existing = [n for n in existing_raw if not skip(n)]
+        cleaned_count = len(existing_raw) - len(existing)
+
         existing_lower = {n.lower() for n in existing}
         new_names = [n for n in names if n.lower() not in existing_lower]
         if not new_names:
-            QMessageBox.information(
-                self, "已是最新",
-                "检测到的进程已全部在放行名单里：\n\n"
-                + "\n".join(f"  • {n}" for n in names))
-            self._refresh_tun_helper_label()
+            if cleaned_count:
+                self.app.cfg["first_hop_process_names"] = existing
+                core.save_config(self.app.cfg)
+                self.app.on_config_change()
+                self.app.toast(f"已清理 {cleaned_count} 个旧版残留")
+                self._refresh_tun_helper_label()
+                self.app.maybe_restart_for_config_change(silent=True)
+            else:
+                QMessageBox.information(
+                    self, "已是最新",
+                    "检测到的进程已全部在放行名单里：\n\n"
+                    + "\n".join(f"  • {n}" for n in names))
+                self._refresh_tun_helper_label()
             return
         joined = "\n".join(f"  • {n}" for n in new_names)
         msg = (f"在端口 {port} 上检测到以下进程，将它们加入 TUN 放行名单？\n\n"
@@ -1243,7 +1259,11 @@ class NodeEditor(QFrame):
         self.app.cfg["first_hop_process_names"] = merged
         core.save_config(self.app.cfg)
         self.app.on_config_change()
-        self.app.toast(f"已添加 {len(new_names)} 个进程到放行名单")
+        if cleaned_count:
+            self.app.toast(
+                f"已添加 {len(new_names)} 个进程；清理 {cleaned_count} 个旧版残留")
+        else:
+            self.app.toast(f"已添加 {len(new_names)} 个进程到放行名单")
         self._refresh_tun_helper_label()
         self.app.maybe_restart_for_config_change(silent=True)
 

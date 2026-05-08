@@ -89,25 +89,15 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
 
 ## 当前状态（2026-05-09）
 
-- ✅ macOS 1.1.8 工程完成（DMG 已打包，待 push + release）
-- ⚠️ **Windows 1.1.8 的「识别本机机场客户端进程」尚未在 Windows 真机验证**——core 代码同名 API
-  已在 `core/_windows.py` 里（`list_airport_client_families`、`detect_first_hop_processes`
-  含 SOCKS5 探测兜底），需要在真机上测：
-  1. **真机环境**：装 1.1.7 或更早版本，并行跑一个 Windows 机场客户端（FastLink Windows /
-     Mihomo Party / Clash Verge / Karing）。从仓库根 `bash scripts/build_windows.ps1` 重新打包。
-  2. **核心场景验证**：第一跳指向 `127.0.0.1:<airport-port>`，开 TUN 模式，点节点页的
-     **「识别本机机场客户端进程」**。预期：弹一个对话框列出按品牌分组的家族（FastLink /
-     Karing / Clash Verge ...），用户选一个后只把那一族的进程名加进 `first_hop_process_names`。
-  3. **Windows 特殊点**：
-     - `_listening_pid_powershell` / `_listening_pid_netstat` 在管理员下能看到 SYSTEM 的
-       socket，所以 SOCKS5 兜底仅在权限不足时才触发（macOS 是 root listener 看不到）。
-     - 进程名有 `.exe` 后缀（`mihomo.exe` 等），patterns 已用 `^mihomo$` 这类锚定，需要
-       考虑 patterns 是否吞 `.exe`。运行 `python tests\test_new_helpers.py` 应当全过。
-     - PyInstaller 需要把 `core/` 当包打进 EXE，`scripts/chainproxy_windows.spec` 已经处理。
-  4. **预期回归**：YAML parity 测试 + new_helpers 测试 + node_editor_tun 测试 都过。
+- ✅ Windows 1.1.9 工程完成 + 真机验证通过（brand chooser、`.exe` 后缀剥除、conhost/svchost
+  噪音过滤、旧版残留自动清理）；安装器 `dist\ChainProxy-Setup-1.1.9.exe` 已打包并发 release
+- ⚠️ macOS 1.1.9 DMG 待 macOS 上重打。1.1.8 macOS DMG 被 1.1.9 取代——新增的 `.exe`-strip
+  + `name_should_skip` 修法在 macOS 上是无害空 op（macOS 进程名本来就没 `.exe`），但为版本
+  对齐应重打 1.1.9 DMG
 - 🚀 历史发布：1.0.1（macOS 首发） → 1.1.0–1.1.6（多版本 Win/Mac 同步） → 1.1.7（GeoIP
-  bundle + auto-detect button） → 1.1.8（**新**：brand-grouped chooser、SOCKS5 探测兜底、
-  helper 版本号修复、`<defunct>` 过滤、配置 `.bak` 备份）
+  bundle + auto-detect button） → 1.1.8（brand-grouped chooser、SOCKS5 探测兜底、helper
+  版本号修复、`<defunct>` 过滤、配置 `.bak` 备份；macOS DMG 已打但未发，被 1.1.9 取代）→
+  1.1.9（Windows 真机验证修补：`.exe` 后缀、shell 噪音过滤、自动清理旧版残留）
 
 ## 1.1.8 改动清单（核心）
 
@@ -130,6 +120,19 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
 - **TUN 冲突检测加 IFF_UP 校验**：之前误把自己 down 但残留 IP 的 utun 当成另一个 TUN 软件。
 - **诊断 trace**：`runtime/tail-debug.log` 记录 tail 的 START/EXIT/IDLE/REOPEN 事件 +
   GUI 的 stop()/start() 调用栈，方便日后排"日志卡住"类问题。
+
+## 1.1.9 改动清单（Windows 真机验证修补）
+
+- **`.exe` 后缀剥除**：`airport_brand_for_name` 入口剥 `.exe`，让 5 个 `$` 锚定的 brand
+  patterns（`^mihomo$` / `^v2ray$` / `^xray$` / `^sgw$` / `^Stash$`）能匹配 Windows 形式。
+  之前裸跑 `mihomo.exe` 当机场核心时 SOCKS5 兜底返回空。
+- **shell/console 噪音过滤**：`_NEVER_WHITELIST` 改为 bare 名，`name_should_skip` 入口剥
+  `.exe`。`_windows.py` 的直接 PID 分支 `push()` 改为调 `name_should_skip`，挡住 `conhost.exe`
+  / `svchost.exe` / `python.exe` / `powershell.exe` 等渗进 whitelist。
+- **`_auto_detect_processes` 自动清理旧版残留**：每次点「识别」时把 existing 列表里命中
+  `_NEVER_WHITELIST` 的项剔除并保存，让升级用户的 stale config 自愈。
+- **`name_should_skip` 公开导出**：加进 `core/_windows.py` + `core/_macos.py` 的 `__all__`，
+  GUI 通过 `core.name_should_skip` 访问。
 
 ## 注意事项（来自 2026-05-09 调试经验）
 
