@@ -1,0 +1,116 @@
+"""Tests for the new helpers: seed_geodata + detect_first_hop_processes.
+
+Both must be safe to call in any environment — when bundled assets are
+missing or no process is listening on the queried port, they should return
+gracefully (no exceptions, empty results).
+
+Run from the repo root: py tests\\test_new_helpers.py
+"""
+import os
+import socket
+import sys
+import tempfile
+from pathlib import Path
+
+# Force offscreen QPA so Qt does not try to talk to a display
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+# Redirect SUPPORT_DIR to a tempdir so we don't trash the user's real config
+_TMP = Path(tempfile.mkdtemp(prefix="chainproxy_helpers_"))
+if sys.platform == "win32":
+    os.environ["APPDATA"] = str(_TMP)
+else:
+    # macOS uses ~/Library/Application Support/ChainProxy/ which we can't
+    # easily redirect — skip the seed-into-runtime test on macOS by writing
+    # to a tempdir directly through the underlying _common helper.
+    pass
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import chainproxy_core as core  # noqa: E402
+import core._common as common  # noqa: E402
+
+# 1. seed_geodata with a missing bundle dir: must be no-op, no crash
+n = common.seed_geodata(None, _TMP)
+assert n == [], f"seed_geodata(None) should return [], got {n!r}"
+
+n = common.seed_geodata(_TMP / "does_not_exist", _TMP)
+assert n == [], f"seed_geodata(missing) should return [], got {n!r}"
+print("[helpers] seed_geodata no-op when bundle dir missing: OK")
+
+# 2. seed_geodata copies real files when present
+src_dir = _TMP / "bundle"
+src_dir.mkdir(parents=True, exist_ok=True)
+runtime_dir = _TMP / "runtime"
+# Create dummy files large enough to pass the >0 byte check
+for fn in ("Country.mmdb", "geoip.dat", "geosite.dat"):
+    (src_dir / fn).write_bytes(b"FAKE_GEODATA_FOR_TEST" * 100)
+seeded = common.seed_geodata(src_dir, runtime_dir)
+assert set(seeded) == {"Country.mmdb", "geoip.dat", "geosite.dat"}, \
+    f"expected all three seeded, got {seeded!r}"
+for fn in ("Country.mmdb", "geoip.dat", "geosite.dat"):
+    assert (runtime_dir / fn).exists()
+    assert (runtime_dir / fn).stat().st_size > 0
+print("[helpers] seed_geodata copies bundled files: OK")
+
+# 3. seed_geodata is idempotent — second call shouldn't reseed anything
+seeded2 = common.seed_geodata(src_dir, runtime_dir)
+assert seeded2 == [], f"second seed should be no-op, got {seeded2!r}"
+print("[helpers] seed_geodata idempotent: OK")
+
+# 4. seed_geodata reseeds zero-byte files (mihomo's "delete and retry" leaves
+#    these). This guards against the original failure mode.
+(runtime_dir / "Country.mmdb").write_bytes(b"")
+seeded3 = common.seed_geodata(src_dir, runtime_dir)
+assert "Country.mmdb" in seeded3, \
+    f"empty file should be reseeded, got {seeded3!r}"
+print("[helpers] seed_geodata reseeds empty files: OK")
+
+# 5. detect_first_hop_processes on a non-loopback host: empty
+if hasattr(core, "detect_first_hop_processes"):
+    result = core.detect_first_hop_processes("8.8.8.8", 53)
+    assert result == [], \
+        f"non-loopback host should return [], got {result!r}"
+    print("[helpers] detect_first_hop_processes on remote host: OK")
+
+    # 6. detect_first_hop_processes on a port nobody owns: empty (using a
+    #    high port unlikely to be in use). We pick an ephemeral free one.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    free_port = s.getsockname()[1]
+    s.close()
+    # Tiny race — but on virtually all systems nobody else binds in this
+    # microsecond window
+    result = core.detect_first_hop_processes("127.0.0.1", free_port)
+    assert result == [], \
+        f"unowned port should return [], got {result!r}"
+    print("[helpers] detect_first_hop_processes on unowned port: OK")
+
+    # 7. detect_first_hop_processes on a port we just opened: must return
+    #    at least our own python process (the one running this test)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    held_port = listener.getsockname()[1]
+    try:
+        names = core.detect_first_hop_processes("127.0.0.1", held_port)
+        assert names, \
+            f"port {held_port} held by us, expected non-empty list, got {names!r}"
+        # Should contain python.exe / python (the binary that's running us)
+        py_match = any("python" in n.lower() for n in names)
+        assert py_match, \
+            f"expected python.exe in detection of our own listener, got {names!r}"
+        print(f"[helpers] detect_first_hop_processes on owned port: OK ({names})")
+    finally:
+        listener.close()
+else:
+    print("[helpers] detect_first_hop_processes: not exposed on this platform (skipped)")
+
+# 8. core exposes the new symbols
+assert hasattr(core, "seed_geodata"), "core.seed_geodata missing"
+assert hasattr(core, "BUNDLED_GEODATA_DIR"), "core.BUNDLED_GEODATA_DIR missing"
+print("[helpers] core surface includes new symbols: OK")
+
+# Cleanup
+import shutil  # noqa: E402
+shutil.rmtree(_TMP, ignore_errors=True)
+print("\n[helpers] ALL TESTS PASSED")

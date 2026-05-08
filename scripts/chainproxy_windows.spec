@@ -34,6 +34,17 @@ datas = [
     (str(REPO / "icon.ico"), "."),
 ]
 
+# Bundled GeoIP/GeoSite snapshot (Country.mmdb / geoip.dat / geosite.dat).
+# build_windows.ps1 stages these into scripts/geodata/ before running
+# PyInstaller. We ship them at "geodata/" so seed_geodata can find them at
+# <exedir>/geodata/ or <exedir>/_internal/geodata/.
+geodata_dir = REPO / "scripts" / "geodata"
+if geodata_dir.is_dir():
+    for fname in ("Country.mmdb", "geoip.dat", "geosite.dat"):
+        f = geodata_dir / fname
+        if f.exists() and f.stat().st_size > 1024:
+            datas.append((str(f), "geodata"))
+
 a = Analysis(
     [str(REPO / "chainproxy_qt.py")],
     pathex=[str(REPO)],

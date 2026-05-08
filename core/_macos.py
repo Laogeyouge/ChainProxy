@@ -34,6 +34,25 @@ MIHOMO_BIN_CANDIDATES = [
     shutil.which("mihomo") or "",
 ]
 
+# Bundled geodata dir (Country.mmdb / geoip.dat / geosite.dat) — see
+# seed_geodata in _common.py for the rationale.
+def _find_bundled_geodata_dir():
+    here = Path(__file__).resolve()
+    candidates = [
+        # When installed as ChainProxy.app, _macos.py lives at
+        # ChainProxy.app/Contents/Resources/core/_macos.py
+        here.parent.parent / "geodata",
+        # Source-mode dev runs
+        here.parent.parent / "scripts" / "geodata",
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return None
+
+
+BUNDLED_GEODATA_DIR = _find_bundled_geodata_dir()
+
 # ---------- helper-script for TUN privilege ----------
 HELPER_PATH = "/usr/local/bin/chainproxy-helper.sh"
 SUDOERS_PATH = "/etc/sudoers.d/chainproxy"
@@ -307,6 +326,123 @@ def rule_set_local_path_exists(name):
 
 def build_mihomo_yaml(cfg):
     return _build_mihomo_yaml_raw(cfg, RULESET_DIR)
+
+
+def seed_geodata(log_cb=None):
+    return _common.seed_geodata(BUNDLED_GEODATA_DIR, RUNTIME_DIR, log_cb=log_cb)
+
+
+# ---------- process tree detection (TUN loop-prevention helper) ----------
+#
+# Mirrors the Windows helper. macOS mihomo also supports PROCESS-NAME rules,
+# so when the user's first hop is on 127.0.0.1 we auto-fill
+# first_hop_process_names from the PID listening on that port.
+
+def _listening_pid_lsof(port):
+    """Return the PID LISTENing on TCP `port`, prefer loopback bindings."""
+    try:
+        r = subprocess.run(
+            ["lsof", "-nP", "-iTCP:" + str(int(port)), "-sTCP:LISTEN", "-F", "pn"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    # lsof -F output: lines start with field-tag chars. 'p' = PID, 'n' = name.
+    # Records group by `p<pid>` followed by zero or more 'f'/'n' lines until
+    # the next 'p'. We pick the loopback row's PID, fall back to first.
+    pid = None
+    loopback_pid = None
+    for line in (r.stdout or "").splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "p":
+            try:
+                pid = int(val)
+            except ValueError:
+                pid = None
+        elif tag == "n" and pid is not None:
+            if "127.0.0.1:" in val or "[::1]:" in val:
+                loopback_pid = pid
+    return loopback_pid or pid
+
+
+def _proc_info_mac(pid):
+    """Return (process name, parent PID) for `pid`, or (None, None)."""
+    try:
+        r = subprocess.run(
+            ["ps", "-o", "comm=,ppid=", "-p", str(int(pid))],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return (None, None)
+    line = (r.stdout or "").strip()
+    if not line:
+        return (None, None)
+    # ps prints: "/path/to/exe 1234"  — last token is ppid, rest is comm.
+    parts = line.rsplit(None, 1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        return (None, None)
+    comm = os.path.basename(parts[0])
+    return (comm or None, int(parts[1]))
+
+
+def _children_names_mac(pid):
+    """Return basename of every process whose PPID == pid."""
+    try:
+        r = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid=,comm="],
+            capture_output=True, text=True, timeout=4,
+        )
+    except Exception:
+        return []
+    names = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        if ppid != int(pid):
+            continue
+        names.append(os.path.basename(parts[2]))
+    return names
+
+
+def detect_first_hop_processes(host, port):
+    """See _windows.detect_first_hop_processes — same contract."""
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return []
+    pid = _listening_pid_lsof(port)
+    if not pid:
+        return []
+    names = []
+    seen = set()
+
+    def push(name):
+        if not name:
+            return
+        key = name.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        names.append(name)
+
+    self_name, ppid = _proc_info_mac(pid)
+    push(self_name)
+    if ppid and ppid > 1:  # 1 = launchd
+        parent_name, _ = _proc_info_mac(ppid)
+        # Skip launcher shells / launchd children — not the airport client.
+        if parent_name and parent_name.lower() not in (
+                "launchd", "bash", "zsh", "sh", "login", "terminal"):
+            push(parent_name)
+            for n in _children_names_mac(ppid):
+                push(n)
+    for n in _children_names_mac(pid):
+        push(n)
+    return names
 
 
 def test_url_through_proxy(url, local_port, log_path, timeout=15,
@@ -719,11 +855,13 @@ __all__ = [
     # paths
     "SUPPORT_DIR", "CONFIG_PATH", "RUNTIME_DIR", "MIHOMO_YAML",
     "MIHOMO_LOG", "RULESET_DIR", "MIHOMO_BIN_CANDIDATES",
+    "BUNDLED_GEODATA_DIR",
     # config / rule-set IO
     "load_config", "save_config", "download_rule_set",
     "update_all_rule_sets", "rule_set_local_path_exists",
     # mihomo + yaml
     "build_mihomo_yaml", "proxy_to_mihomo", "find_mihomo",
+    "seed_geodata", "detect_first_hop_processes",
     # network probes / tests
     "tcp_reachable", "test_url_through_proxy",
     # platform: system proxy / panic / runner / single instance

@@ -12,7 +12,8 @@
 
 param(
     [switch]$SkipInstaller,
-    [string]$MihomoVersion = "v1.19.24"
+    [string]$MihomoVersion = "v1.19.24",
+    [switch]$ForceGeodataRefresh
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,12 +36,12 @@ $REPO    = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $SCRIPTS = Join-Path $REPO "scripts"
 Set-Location $REPO
 
-Write-Host "==[1/5]== Regenerating icon.ico" -ForegroundColor Cyan
+Write-Host "==[1/6]== Regenerating icon.ico" -ForegroundColor Cyan
 Invoke-Native { py scripts\make_icon_windows.py }
 if ($LASTEXITCODE -ne 0) { throw "icon generation failed (exit $LASTEXITCODE)" }
 
 Write-Host ""
-Write-Host "==[2/5]== Ensuring bundled mihomo.exe is present" -ForegroundColor Cyan
+Write-Host "==[2/6]== Ensuring bundled mihomo.exe is present" -ForegroundColor Cyan
 $mihomoLocal = Join-Path $SCRIPTS "mihomo.exe"
 if (Test-Path $mihomoLocal) {
     $size = (Get-Item $mihomoLocal).Length
@@ -62,12 +63,55 @@ if (Test-Path $mihomoLocal) {
 }
 
 Write-Host ""
-Write-Host "==[3/5]== Cleaning previous dist/ and build/" -ForegroundColor Cyan
+Write-Host "==[3/6]== Ensuring bundled GeoIP/GeoSite snapshot is present" -ForegroundColor Cyan
+# Without these files mihomo cold-starts will deadlock on a fresh install:
+# its default download URL is on github.com, which is unreachable until
+# ChainProxy's proxy is up — and the proxy can't come up without these files.
+# We snapshot the latest Loyalsoldier release at build time so the installer
+# is self-sufficient.
+$geodataDir = Join-Path $SCRIPTS "geodata"
+if (-not (Test-Path $geodataDir)) {
+    New-Item -ItemType Directory -Path $geodataDir | Out-Null
+}
+$geodataAssets = @(
+    @{ Name = "Country.mmdb";
+       Url  = "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb" },
+    @{ Name = "geoip.dat";
+       Url  = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" },
+    @{ Name = "geosite.dat";
+       Url  = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" }
+)
+foreach ($a in $geodataAssets) {
+    $dest = Join-Path $geodataDir $a.Name
+    if ((Test-Path $dest) -and -not $ForceGeodataRefresh) {
+        $size = (Get-Item $dest).Length
+        if ($size -gt 1024) {
+            Write-Host ("  found {0} ({1:N0} bytes)" -f $a.Name, $size)
+            continue
+        }
+    }
+    Write-Host "  fetching $($a.Url) ..."
+    try {
+        Invoke-WebRequest -Uri $a.Url -OutFile $dest -UseBasicParsing -MaximumRedirection 5
+        $size = (Get-Item $dest).Length
+        if ($size -lt 1024) {
+            throw "downloaded file looks empty: $size bytes"
+        }
+        Write-Host ("  installed {0} ({1:N0} bytes)" -f $a.Name, $size)
+    } catch {
+        Write-Warning "geodata download failed for $($a.Name): $_"
+        Write-Warning "  Build will continue, but cold-start mihomo on offline / GFW boxes will fail."
+        if (Test-Path $dest) { Remove-Item -Force $dest }
+    }
+}
+
+Write-Host ""
+Write-Host "==[4/6]== Cleaning previous dist/ and build/" -ForegroundColor Cyan
 if (Test-Path "dist")  { Remove-Item -Recurse -Force "dist" }
 if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
 
 Write-Host ""
-Write-Host "==[4/5]== Running PyInstaller" -ForegroundColor Cyan
+Write-Host "==[5/6]== Running PyInstaller" -ForegroundColor Cyan
 Invoke-Native { py -m PyInstaller --noconfirm --clean scripts\chainproxy_windows.spec }
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed (exit $LASTEXITCODE)" }
 
@@ -84,7 +128,7 @@ if (-not (Test-Path $bundledMihomo)) {
 }
 
 Write-Host ""
-Write-Host "==[5/5]== Inno Setup installer" -ForegroundColor Cyan
+Write-Host "==[6/6]== Inno Setup installer" -ForegroundColor Cyan
 if ($SkipInstaller) {
     Write-Host "  -SkipInstaller passed; stopping here. Use dist\ChainProxy\ChainProxy.exe to test."
     exit 0

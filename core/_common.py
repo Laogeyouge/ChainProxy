@@ -221,6 +221,64 @@ def rule_set_local_path_exists(name, ruleset_dir: Path):
     return (ruleset_dir / f"{name}.txt").exists()
 
 
+# ---------- geo-data (MMDB / dat) seeding ----------
+#
+# mihomo needs a GeoIP MMDB to evaluate `GEOIP,CN`/`GEOIP,LAN` rules. When it
+# can't find one, it tries to download from a default GitHub URL. On a fresh
+# Windows install where the user has no proxy yet (the very situation
+# ChainProxy is meant to bootstrap), GitHub is unreachable, the download
+# fails, mihomo deletes the empty file and retries forever — controller never
+# binds, ChainProxy reports "mihomo 启动后立即崩溃".
+#
+# Fix: ship a snapshot of the three Loyalsoldier files inside the installer/
+# .app and copy them into runtime/ on every startup if the runtime copy is
+# missing or empty. This eliminates the cold-start dependency on GitHub.
+GEODATA_FILES = ("Country.mmdb", "geoip.dat", "geosite.dat")
+
+
+def seed_geodata(bundled_dir: Path, runtime_dir: Path, log_cb=None):
+    """Copy the bundled mmdb/dat snapshot into runtime_dir if not already
+    present. Safe to call on every startup — it's a no-op when the runtime
+    copy exists and is non-empty.
+
+    Returns the list of filenames that were freshly copied (or [] if nothing
+    needed seeding).
+    """
+    seeded = []
+    try:
+        bundled_dir = Path(bundled_dir) if bundled_dir else None
+    except Exception:
+        bundled_dir = None
+    if not bundled_dir or not bundled_dir.is_dir():
+        return seeded
+    runtime_dir = Path(runtime_dir)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    for name in GEODATA_FILES:
+        src = bundled_dir / name
+        dst = runtime_dir / name
+        if not src.exists():
+            continue
+        # Don't clobber a file that's already healthy. mihomo updates these
+        # in place when /configs/geo is poked, and we shouldn't wind that
+        # forward-progress backwards just because the user reinstalled.
+        if dst.exists() and dst.stat().st_size > 0:
+            continue
+        try:
+            data = src.read_bytes()
+            if not data:
+                continue
+            tmp = dst.with_name(f".{dst.name}.tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, dst)
+            seeded.append(name)
+        except OSError as e:
+            if log_cb:
+                log_cb(f"seed_geodata: {name} 复制失败：{e}")
+    if seeded and log_cb:
+        log_cb(f"已铺设 GeoIP 数据：{', '.join(seeded)}")
+    return seeded
+
+
 # ---------- mihomo yaml generation ----------
 
 def proxy_to_mihomo(p):

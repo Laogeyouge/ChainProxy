@@ -942,7 +942,32 @@ class NodeEditor(QFrame):
         self.empty_hint.setMinimumHeight(80)
         self.empty_hint.hide()
 
-        body = vbox(head, divider(soft=True), grid, self.empty_hint,
+        # TUN loop-prevention helper — only on the first-hop editor.
+        # Replaces the old "go edit config.json by hand" UX. We auto-detect
+        # which process is listening on the configured port and propose
+        # adding it (and its parent/children) to first_hop_process_names.
+        self.tun_helper = None
+        if self.kind == "first":
+            self.tun_helper = QFrame()
+            tun_btn = B("识别本机机场客户端进程", "ghost", self._auto_detect_processes)
+            self.tun_proc_label = L("", "rowSub")
+            self.tun_proc_label.setWordWrap(True)
+            tun_help = L(
+                "若第一跳指向 127.0.0.1 且开了 TUN 模式，需把机场客户端的进程"
+                "加入放行名单，否则它的拨号会被 TUN 抓回造成死锁。",
+                "rowSub")
+            tun_help.setWordWrap(True)
+            self.tun_helper.setLayout(vbox(
+                hbox(L("TUN 放行名单", "rowLabel"), "stretch", tun_btn, spacing=8),
+                tun_help,
+                self.tun_proc_label,
+                spacing=6, margins=(14, 12, 14, 12),
+            ))
+
+        body_children = [head, divider(soft=True), grid, self.empty_hint]
+        if self.tun_helper is not None:
+            body_children += [divider(soft=True), self.tun_helper]
+        body = vbox(*body_children,
                     spacing=14, margins=(20, 18, 20, 18))
         self.setLayout(body)
 
@@ -975,6 +1000,7 @@ class NodeEditor(QFrame):
             self._load(active)
         else:
             self._clear_form()
+        self._refresh_tun_helper_label()
 
     def _on_select(self, name):
         if not name or self._loading:
@@ -1125,6 +1151,78 @@ class NodeEditor(QFrame):
         self.refresh()
         self.app.on_config_change()
         self.app.toast(f"已删除：{cur}")
+
+    def _auto_detect_processes(self):
+        """Look up which process is listening on the current first-hop port,
+        propose adding it (+ parent + children) to first_hop_process_names.
+        Surfaces the same identity work users used to do by reading task
+        manager and editing config.json by hand."""
+        host = self.f_server.text().strip() or "127.0.0.1"
+        try:
+            port = int(self.f_port.text().strip())
+        except ValueError:
+            QMessageBox.information(
+                self, "识别进程",
+                "请先填写第一跳的端口。")
+            return
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            QMessageBox.information(
+                self, "识别进程",
+                "此功能只在第一跳指向本机（127.0.0.1）时有意义。\n\n"
+                "TUN 模式只会回环本机流量，远程节点不需要进程放行。")
+            return
+        if not hasattr(core, "detect_first_hop_processes"):
+            QMessageBox.information(
+                self, "识别进程",
+                "当前平台暂不支持自动识别。请手动编辑 config.json 的"
+                " first_hop_process_names。")
+            return
+        names = core.detect_first_hop_processes(host, port)
+        if not names:
+            QMessageBox.information(
+                self, "未检测到进程",
+                f"端口 {port} 当前没有监听进程。\n\n"
+                "请先打开你的机场客户端（FastLink / Clash Verge / v2rayN…），"
+                "确认它已在该端口启动 SOCKS5 / HTTP 代理后再点一次。")
+            return
+        existing = list(self.app.cfg.get("first_hop_process_names") or [])
+        existing_lower = {n.lower() for n in existing}
+        new_names = [n for n in names if n.lower() not in existing_lower]
+        if not new_names:
+            QMessageBox.information(
+                self, "已是最新",
+                "检测到的进程已全部在放行名单里：\n\n"
+                + "\n".join(f"  • {n}" for n in names))
+            self._refresh_tun_helper_label()
+            return
+        joined = "\n".join(f"  • {n}" for n in new_names)
+        msg = (f"在端口 {port} 上检测到以下进程，将它们加入 TUN 放行名单？\n\n"
+               f"{joined}\n\n"
+               "（包含监听进程本身、它的父进程，以及由父进程派生的代理引擎子进程。）")
+        if QMessageBox.question(
+                self, "识别到的客户端进程",
+                msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        merged = existing + new_names
+        self.app.cfg["first_hop_process_names"] = merged
+        core.save_config(self.app.cfg)
+        self.app.on_config_change()
+        self.app.toast(f"已添加 {len(new_names)} 个进程到放行名单")
+        self._refresh_tun_helper_label()
+        self.app.maybe_restart_for_config_change(silent=True)
+
+    def _refresh_tun_helper_label(self):
+        if not getattr(self, "tun_proc_label", None):
+            return
+        names = list(self.app.cfg.get("first_hop_process_names") or [])
+        if names:
+            self.tun_proc_label.setText(
+                "已放行：" + "、".join(names))
+        else:
+            self.tun_proc_label.setText(
+                "尚未配置任何放行进程。开 TUN + 第一跳指向本机时，请点上方按钮自动识别。")
 
 
 class NodesPage(QWidget):
@@ -1728,7 +1826,8 @@ class SettingsPage(QWidget):
                        "• 每次启动 mihomo 都会弹 UAC 授权（Windows 限制）\n"
                        "• 异常断网时点「网络急救」恢复\n"
                        "• 你的机场客户端自身的 TUN 必须关闭\n"
-                       "• 务必在「first_hop_process_names」里填上机场客户端进程名")
+                       "• 第一跳指向本机时，启动会自动识别并放行机场客户端进程；"
+                       "也可在「节点」页手动点「识别本机机场客户端进程」")
             QMessageBox.information(self, "TUN 模式", msg)
         self.app.on_config_change()
         if self.app.runner.is_running():
@@ -1772,6 +1871,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.q_app = app
         self.cfg = core.load_config()
+        # Seed bundled GeoIP/GeoSite into runtime/ before mihomo gets a chance
+        # to look for them. Without this, fresh-install users on offline /
+        # GFW boxes hit a download death-loop in mihomo (default URL is on
+        # github.com, unreachable until we're up). seed_geodata is a no-op
+        # when the runtime copy already exists.
+        try:
+            core.seed_geodata(log_cb=lambda m: None)
+        except Exception:
+            pass
         self.runner = core.MihomoRunner(self.log)
         # When mihomo dies on its own (panic / OOM / segfault), the runner
         # fires this from its tail thread. We bounce to the Qt main thread
@@ -2398,24 +2506,45 @@ class MainWindow(QMainWindow):
             return
         # TUN-mode loop-prevention guard: if the first hop is on 127.0.0.1
         # (i.e. it's another local proxy client whose own outbound traffic
-        # would be re-captured by our TUN), require the user to list that
-        # client's process names. Without this, every dial through the
-        # first hop deadlocks and TLS times out.
+        # would be re-captured by our TUN), we need its process names so
+        # PROCESS-NAME,xxx,DIRECT bypass rules can be emitted. Without that
+        # every dial deadlocks with "context deadline exceeded".
+        # Strategy: auto-detect silently first; only stop the user with a
+        # wall if detection turns up nothing (port unowned, lookup blocked).
         if (self.cfg.get("tun_mode")
                 and fh["server"] in ("127.0.0.1", "localhost", "::1")
                 and not (self.cfg.get("first_hop_process_names") or [])):
-            fail("TUN 模式配置不完整",
-                 "你启用了 TUN 模式，且第一跳指向本机 "
-                 f"({fh['server']}:{fh['port']})。\n\n"
-                 "TUN 会捕获**所有** IPv4 流量，包括你机场客户端自己的拨号 — "
-                 "这会让客户端连不上它的远程服务器，TLS 握手永远失败。\n\n"
-                 "解决方案任选其一：\n"
-                 "  ① 关闭 TUN 模式（设置页），改用「系统代理模式」（推荐）\n"
-                 "  ② 在 config.json 的 first_hop_process_names 里填上你机场\n"
-                 "     客户端的所有 .exe 进程名（含 GUI 主进程和它派生的代理引擎）\n\n"
-                 f"配置文件：{core.CONFIG_PATH}",
-                 critical=True)
-            return
+            detected = []
+            if hasattr(core, "detect_first_hop_processes"):
+                try:
+                    detected = core.detect_first_hop_processes(
+                        fh["server"], int(fh["port"]))
+                except Exception:
+                    detected = []
+            if detected:
+                self.cfg["first_hop_process_names"] = list(detected)
+                core.save_config(self.cfg)
+                self.log(
+                    "TUN 模式：自动放行进程 " + "、".join(detected))
+                # Refresh the node-edit label so the user sees the new state
+                # if they switch to that page.
+                try:
+                    if getattr(self, "nodes_page", None):
+                        self.nodes_page.first._refresh_tun_helper_label()
+                except Exception:
+                    pass
+            else:
+                fail("TUN 模式配置不完整",
+                     "你启用了 TUN 模式，且第一跳指向本机 "
+                     f"({fh['server']}:{fh['port']})，但端口当前没有监听进程，"
+                     "无法自动识别要放行的客户端。\n\n"
+                     "请检查：\n"
+                     "  ① 你的机场客户端是否已经启动并监听该端口？\n"
+                     "  ② 端口号是否填对了？\n\n"
+                     "确认后到「节点」页点「识别本机机场客户端进程」按钮重试，"
+                     "或直接关闭 TUN 模式改走系统代理。",
+                     critical=True)
+                return
         try:
             yaml = core.build_mihomo_yaml(self.cfg)
         except Exception as e:

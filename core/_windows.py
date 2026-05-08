@@ -66,6 +66,30 @@ MIHOMO_BIN_CANDIDATES = [str(p) for p in _BUNDLED_CANDIDATES] + [
     shutil.which("mihomo.exe") or "",
 ]
 
+# Bundled geodata (Country.mmdb / geoip.dat / geosite.dat) — see seed_geodata.
+# PyInstaller --onedir puts datas under <exedir>\_internal\geodata, while
+# --onefile expands to sys._MEIPASS\geodata. Source-mode dev runs look at
+# scripts\geodata next to the repo.
+def _find_bundled_geodata_dir():
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        candidates.append(exe_dir / "geodata")
+        candidates.append(exe_dir / "_internal" / "geodata")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "geodata")
+    # Source-mode: repo root (scripts/geodata)
+    here = Path(__file__).resolve()
+    candidates.append(here.parent.parent / "scripts" / "geodata")
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return None
+
+
+BUNDLED_GEODATA_DIR = _find_bundled_geodata_dir()
+
 
 # ---------- config & rule-set wrappers (inject paths) ----------
 
@@ -98,6 +122,168 @@ def rule_set_local_path_exists(name):
 
 def build_mihomo_yaml(cfg):
     return _build_mihomo_yaml_raw(cfg, RULESET_DIR)
+
+
+def seed_geodata(log_cb=None):
+    return _common.seed_geodata(BUNDLED_GEODATA_DIR, RUNTIME_DIR, log_cb=log_cb)
+
+
+# ---------- process tree detection (TUN loop-prevention helper) ----------
+#
+# When the user's first hop is 127.0.0.1:N we need to mark the airport
+# client's processes as DIRECT in mihomo so its outbound dial isn't recaptured
+# by our TUN. This used to require the user to know what an "代理引擎" is and
+# manually edit JSON. Now we look up which PID owns the listening socket on
+# port N, walk one level up (parent — the GUI launcher) and one level down
+# (children — the proxy engine spawned by the GUI), and propose those .exe
+# names.
+
+def _ps_run(cmd, timeout=6):
+    """Run a PowerShell command; return stdout text or '' on failure."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", cmd],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return ""
+    return r.stdout or ""
+
+
+def _listening_pid_powershell(port):
+    """Return the OwningProcess of whatever is LISTENing on TCP `port`,
+    preferring the loopback binding."""
+    out = _ps_run(
+        f"Get-NetTCPConnection -LocalPort {int(port)} -State Listen "
+        f"-ErrorAction SilentlyContinue | "
+        f"Select-Object -Property LocalAddress,OwningProcess | "
+        f"Format-Table -HideTableHeaders | Out-String"
+    )
+    candidates = []
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        addr, pid_s = parts[0], parts[-1]
+        if not pid_s.isdigit():
+            continue
+        candidates.append((addr, int(pid_s)))
+    if not candidates:
+        return None
+    # Prefer 127.0.0.1 / ::1 over 0.0.0.0 / ::; users with multi-binding apps
+    # often see one row per address.
+    for addr, pid in candidates:
+        if addr in ("127.0.0.1", "::1"):
+            return pid
+    return candidates[0][1]
+
+
+def _listening_pid_netstat(port):
+    """Fallback when Get-NetTCPConnection isn't available (very old Windows
+    or locked-down environments). netstat is shipped with every Windows."""
+    try:
+        r = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return None
+    suffix_a = f":{int(port)}"
+    candidates = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        proto, local, foreign, state, pid_s = parts[:5]
+        if proto.upper() != "TCP" or "LISTEN" not in state.upper():
+            continue
+        if not local.endswith(suffix_a):
+            continue
+        if not pid_s.isdigit():
+            continue
+        candidates.append((local, int(pid_s)))
+    if not candidates:
+        return None
+    # Prefer loopback bindings — same reasoning as above.
+    for local, pid in candidates:
+        if local.startswith("127.0.0.1:") or local.startswith("[::1]:"):
+            return pid
+    return candidates[0][1]
+
+
+def _proc_info(pid):
+    """Return (Name, ParentProcessId) for a PID, or (None, None)."""
+    out = _ps_run(
+        f"Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}' "
+        f"-ErrorAction SilentlyContinue | "
+        f"Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue"
+    )
+    name = (out or "").strip().splitlines()[0] if out else ""
+    out2 = _ps_run(
+        f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}' "
+        f"-ErrorAction SilentlyContinue).ParentProcessId"
+    )
+    ppid_s = (out2 or "").strip()
+    ppid = int(ppid_s) if ppid_s.isdigit() else None
+    return (name or None), ppid
+
+
+def _children_names(pid):
+    """Return list of child .exe names whose ParentProcessId == pid."""
+    out = _ps_run(
+        f"Get-CimInstance Win32_Process -Filter 'ParentProcessId={int(pid)}' "
+        f"-ErrorAction SilentlyContinue | "
+        f"Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue"
+    )
+    names = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    return names
+
+
+def detect_first_hop_processes(host, port):
+    """Given a (host, port) of a local first hop, return a deduplicated list
+    of .exe names that should be added to first_hop_process_names so TUN
+    bypasses them (parent + self + children of the listening process).
+
+    Returns []  when nothing is listening on that port, or detection failed.
+    """
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return []
+    pid = _listening_pid_powershell(port) or _listening_pid_netstat(port)
+    if not pid:
+        return []
+    names = []
+    seen = set()
+
+    def push(name):
+        if not name:
+            return
+        # Normalize case for dedup but preserve user-facing case.
+        key = name.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        names.append(name)
+
+    self_name, ppid = _proc_info(pid)
+    push(self_name)
+    if ppid and ppid > 4:  # 0/4 = System idle / System
+        parent_name, _ = _proc_info(ppid)
+        # Skip well-known shell parents — they're not the airport client.
+        if parent_name and parent_name.lower() not in (
+                "explorer.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+                "wininit.exe", "services.exe", "svchost.exe"):
+            push(parent_name)
+            # When parent is the GUI, also pick up its other children
+            # (sibling proxy engines that aren't the listening process).
+            for n in _children_names(ppid):
+                push(n)
+    # And our own children, in case THIS process is the GUI launcher.
+    for n in _children_names(pid):
+        push(n)
+    return names
 
 
 def test_url_through_proxy(url, local_port, log_path, timeout=15,
@@ -825,9 +1011,11 @@ __all__ = [
     "DEFAULT_CONFIG", "PLATFORM_LABEL",
     "SUPPORT_DIR", "CONFIG_PATH", "RUNTIME_DIR", "MIHOMO_YAML",
     "MIHOMO_LOG", "RULESET_DIR", "MIHOMO_BIN_CANDIDATES",
+    "BUNDLED_GEODATA_DIR",
     "load_config", "save_config", "download_rule_set",
     "update_all_rule_sets", "rule_set_local_path_exists",
     "build_mihomo_yaml", "proxy_to_mihomo", "find_mihomo",
+    "seed_geodata", "detect_first_hop_processes",
     "tcp_reachable", "test_url_through_proxy",
     "set_system_proxy", "panic_recover", "bounce_primary_interface",
     "refresh_system_proxy",
