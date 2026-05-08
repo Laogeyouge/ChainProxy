@@ -678,6 +678,77 @@ def name_should_skip(name):
     return n in _NEVER_WHITELIST
 
 
+# ---- macOS bundle-path auto-detect helpers (additive, used by _macos.py) ----
+#
+# macOS 1.1.9 introduces a second detection path that does NOT use AIRPORT_BRANDS.
+# It groups running processes by their .app bundle and uses these generic
+# "looks like a proxy" filters to keep only proxy-bearing bundles. Windows
+# continues to use the brand-list path above; nothing here changes that.
+
+# Generic proxy-engine names. NOT a brand list. These are the well-known
+# proxy CORES — the binaries that actually do the SOCKS5/HTTP proxy work.
+PROXY_CORE_HINTS = [
+    "mihomo", "clash", "sing-box", "singbox", "xray", "v2ray", "v2fly",
+    "hysteria", "trojan", "shadowsocks", "naive", "brook", "juicity",
+    "tuic", "ssr-",
+]
+# Suffix heuristic for branded re-skins of known cores (AtlasCore, CatCore,
+# NekoCore, etc.) without enumerating every vendor's name.
+_PROXY_CORE_SUFFIXES = ("core",)
+
+# Path / bundle-id keywords that strongly hint a proxy/VPN/airport client.
+# Used by the .app-bundle fallback for Karing-style apps that ship a single
+# self-contained binary with no proxy-core child process.
+PROXY_BUNDLE_HINTS = [
+    "proxy", "vpn", "clash", "mihomo", "sing-box", "singbox", "v2ray",
+    "xray", "shadowsocks", "trojan", "hysteria", "naive", "karing",
+    "machine", "机场", "airport",
+]
+
+_ARCH_SUFFIXES = ("_arm64", "_amd64", "_x86_64", "_aarch64", "_x64", "_x86",
+                  "-arm64", "-amd64", "-x86_64", "-aarch64", "-x64", "-x86")
+
+
+def name_looks_like_proxy_core(name):
+    """Return True if `name` is recognizable as a well-known proxy engine
+    (mihomo / clash / sing-box / xray / v2ray / hysteria / trojan / ...) or
+    a branded re-skin ending in 'core' (AtlasCore, CatCore, NekoCore).
+
+    Does NOT identify airport-client *brands* — the brand label is derived
+    from the .app bundle path on disk by the macOS backend, not from the
+    process name. .exe and architecture suffixes are stripped so the same
+    rule works regardless of platform conventions."""
+    if not name:
+        return False
+    n = os.path.basename(name).lower()
+    if n.endswith(".exe"):
+        n = n[: -len(".exe")]
+    for suf in _ARCH_SUFFIXES:
+        if n.endswith(suf):
+            n = n[: -len(suf)]
+            break
+    if n in _NEVER_WHITELIST:
+        return False
+    for hint in PROXY_CORE_HINTS:
+        if hint in n:
+            return True
+    for suf in _PROXY_CORE_SUFFIXES:
+        if n.endswith(suf) and len(n) > len(suf):
+            return True
+    return False
+
+
+def path_hints_proxy_bundle(path):
+    """Return True if `path` (a .app bundle root or bundle ID) contains a
+    keyword that strongly hints this is a proxy/VPN/airport client. Used to
+    rescue brand-only apps where the binary alone gives no signal but the
+    path does (Karing, FastLink机场, etc.)."""
+    if not path:
+        return False
+    p = path.lower()
+    return any(h in p for h in PROXY_BUNDLE_HINTS)
+
+
 def test_url_through_proxy(url, local_port, log_path, curl_devnull,
                            timeout=15, controller_port=None,
                            controller_secret=None):

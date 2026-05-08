@@ -91,13 +91,16 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
 
 - ✅ Windows 1.1.9 工程完成 + 真机验证通过（brand chooser、`.exe` 后缀剥除、conhost/svchost
   噪音过滤、旧版残留自动清理）；安装器 `dist\ChainProxy-Setup-1.1.9.exe` 已打包并发 release
-- ⚠️ macOS 1.1.9 DMG 待 macOS 上重打。1.1.8 macOS DMG 被 1.1.9 取代——新增的 `.exe`-strip
-  + `name_should_skip` 修法在 macOS 上是无害空 op（macOS 进程名本来就没 `.exe`），但为版本
-  对齐应重打 1.1.9 DMG
+- ✅ macOS 1.1.9 已发布——彻底放弃品牌列表，改为 **`netstat -anvp tcp` 拿 listener PID
+  → 走 `.app` bundle → 把 bundle 内进程作为家族返回**。`netstat -v` 不需要 sudo 就能看
+  到 root listener 的 PID（FastLink 的 AtlasCore、Clash Verge 的 verge-mihomo、猫猫云
+  的 CatCore 都是 root 拥有），所以 macOS 端「识别本机机场客户端进程」按钮**只识别
+  用户配置的那个端口对应的那一个 .app**，不会把机器上其他机场客户端拉进白名单。
 - 🚀 历史发布：1.0.1（macOS 首发） → 1.1.0–1.1.6（多版本 Win/Mac 同步） → 1.1.7（GeoIP
   bundle + auto-detect button） → 1.1.8（brand-grouped chooser、SOCKS5 探测兜底、helper
   版本号修复、`<defunct>` 过滤、配置 `.bak` 备份；macOS DMG 已打但未发，被 1.1.9 取代）→
-  1.1.9（Windows 真机验证修补：`.exe` 后缀、shell 噪音过滤、自动清理旧版残留）
+  1.1.9（Windows: `.exe` 后缀、shell 噪音过滤、自动清理旧版残留；macOS: netstat-driven
+  auto-detect 按 .app bundle 路径分组，废弃品牌列表路径）
 
 ## 1.1.8 改动清单（核心）
 

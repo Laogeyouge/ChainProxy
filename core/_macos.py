@@ -372,6 +372,57 @@ def _listening_pid_lsof(port):
     return loopback_pid or pid
 
 
+def _listening_pid_netstat_mac(host, port):
+    """Find the PID listening on `host:port` using `netstat -anvp tcp`.
+
+    Crucially this works for ROOT-owned listeners that user-level lsof
+    cannot see. macOS `netstat -v` prints a `process:pid` column straight
+    from the kernel socket info, regardless of UID. Used as the primary
+    listener-resolver for the auto-detect button so we can pinpoint the
+    one airport client serving the user's first-hop port instead of
+    listing every airport client running on the machine.
+
+    `host="127.0.0.1"` matches both `127.0.0.1.<port>` (loopback-bound)
+    and `*.<port>` (any-interface bound — many proxy cores default to
+    `*` and rely on the user typing 127.0.0.1).
+
+    Returns int PID or None.
+    """
+    try:
+        r = subprocess.run(
+            ["netstat", "-anvp", "tcp"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    p = str(int(port))
+    accept_local = (f"127.0.0.1.{p}", f"*.{p}")
+    if host == "::1":
+        accept_local = (f"::1.{p}", f"*.{p}")
+    for line in (r.stdout or "").splitlines():
+        if "LISTEN" not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        local = parts[3]
+        if local not in accept_local:
+            continue
+        # The process column is somewhere after LISTEN; format
+        # "<comm>:<pid>". Walk all tokens for the first matching shape.
+        for tok in parts[5:]:
+            if ":" not in tok:
+                continue
+            tail = tok.rsplit(":", 1)[-1]
+            if tail.isdigit():
+                try:
+                    return int(tail)
+                except ValueError:
+                    pass
+        break
+    return None
+
+
 def _clean_proc_name(comm):
     """Reject process names that aren't real executable basenames.
 
@@ -468,70 +519,233 @@ def _ps_snapshot_mac():
     return procs
 
 
+def _ps_snapshot_with_path_mac():
+    """Like _ps_snapshot_mac but also keeps the absolute executable path
+    (from the `command` column). The path is what tells us which .app
+    bundle owns each process — that is the source of truth for grouping,
+    not process-name pattern matching.
+
+    Returns list[(pid, ppid, comm_basename, exec_path_or_None)]."""
+    try:
+        r = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid=,comm="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return []
+    procs = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        path = parts[2]
+        bn = _clean_proc_name(os.path.basename(path))
+        if not bn:
+            continue
+        # `comm` is truncated to ~16 chars on macOS, which mangles paths
+        # like /Applications/.../MacOS/<long>. Empty path is fine —
+        # _bundle_root_for_path returns None and the proc is treated as
+        # bundle-less.
+        procs.append((pid, ppid, bn, path if path.startswith("/") else None))
+    return procs
+
+
+def _bundle_root_for_path(p):
+    """Walk up `p`'s ancestors and return the deepest one whose name ends
+    in .app or .bundle. That is the canonical grouping key for a running
+    process: every binary inside the same Foo.app belongs together."""
+    if not p:
+        return None
+    cur = p
+    while cur and cur != "/":
+        base = os.path.basename(cur)
+        if base.endswith(".app") or base.endswith(".bundle"):
+            return cur
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def _bundle_label_from_path(root):
+    """Pretty display label for a .app/.bundle root path. Strips the
+    .app/.bundle suffix and reverse-DNS bundle id segments where the
+    last segment is a generic word like 'service'."""
+    if not root:
+        return None
+    name = os.path.basename(root)
+    for suf in (".bundle", ".app"):
+        if name.lower().endswith(suf):
+            name = name[: -len(suf)]
+    if name.count(".") >= 2:
+        # Reverse-DNS id, e.g.,
+        # "io.github.clash-verge-rev.clash-verge-rev.service" — pick the
+        # most meaningful segment.
+        parts = name.split(".")
+        last = parts[-1].lower()
+        if last in ("service", "helper", "agent", "daemon", "extension"):
+            name = parts[-2] if len(parts) >= 2 else parts[-1]
+        else:
+            name = parts[-1]
+    return name
+
+
+def _bundle_id_from_plist(root):
+    """Read CFBundleIdentifier from a .app/.bundle's Info.plist. Used as
+    an extra signal for path_hints_proxy_bundle — bundle ids often hint
+    at proxy/vpn/karing/clash even when the binary name doesn't."""
+    if not root:
+        return None
+    plist = os.path.join(root, "Contents", "Info.plist")
+    if not os.path.isfile(plist):
+        return None
+    try:
+        r = subprocess.run(
+            ["/usr/libexec/PlistBuddy", "-c",
+             "Print :CFBundleIdentifier", plist],
+            capture_output=True, text=True, timeout=2,
+        )
+        return (r.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def _has_system_extension(root):
+    """A .app contains a SystemExtensions/* entry. Karing-style proxies
+    bundle their packet-routing daemon as a system extension; this lets
+    us detect them even when the only visible running binary is the
+    GUI wrapper."""
+    if not root:
+        return False
+    se_dir = os.path.join(root, "Contents", "Library", "SystemExtensions")
+    try:
+        return os.path.isdir(se_dir) and any(os.scandir(se_dir))
+    except OSError:
+        return False
+
+
 def list_airport_client_families_mac():
-    """Return [{"label": str, "names": [str, ...]}, ...] — one entry per
-    distinct airport-client BRAND currently running.
+    """Auto-discover candidate airport clients by grouping running
+    processes by their .app/.bundle filesystem root.
 
-    Grouping is by brand pattern (Karing / FastLink / Clash Verge / ...) so
-    that products whose GUI and proxy-core are not parent-child (Karing's
-    GUI vs its system-extension service, both PPID=1) still cluster
-    correctly. Without sudo we cannot tell the SOCKS5 listener apart from
-    its PID (root-owned sockets are invisible to user-level lsof), so when
-    multiple brands are running the GUI must ask the user which one owns
-    the queried port.
+    No brand list is consulted. The label of each family is the .app's
+    display name (`猫猫云`, `Karing`, `Clash Verge`...) read from the
+    bundle path on disk. The set of process names in a family is the
+    union of all unique comm-basenames of running processes inside that
+    bundle.
 
-    A brand-matched process's parent is also pulled in IF the parent isn't
-    a generic shell — covers .app launcher binaries that don't themselves
-    contain a brand keyword. Children of brand-matched processes are also
-    pulled in (sibling proxy engines under the same .app).
+    A bundle is kept only if it shows at least one of these proxy signals:
+      1. A running process whose name looks like a known proxy core
+         (mihomo / clash / sing-box / xray / *core / ...).
+      2. The bundle path or its CFBundleIdentifier contains a proxy/vpn
+         hint keyword (catches Karing-style apps that ship a single
+         self-contained binary with no separate core child process).
+      3. The bundle ships a SystemExtensions/*.systemextension (Karing).
+
+    Cross-bundle merge: a process whose parent belongs to a different
+    bundle (e.g., verge-mihomo in /Applications/Clash Verge.app launched
+    by clash-verge-service in /Library/PrivilegedHelperTools/.bundle) is
+    union-merged with its parent's bundle so the user sees one family.
     """
-    procs = _ps_snapshot_mac()
+    procs = _ps_snapshot_with_path_mac()
     if not procs:
         return []
 
-    name_of = {pid: bn for pid, _, bn in procs}
-    children = {}
-    for pid, ppid, _ in procs:
-        children.setdefault(ppid, []).append(pid)
+    bundle_of_pid = {}
+    by_bundle = {}  # bundle_root -> {"comms": set, "pids": set}
+    standalone = {}  # comm (no bundle) -> {"comms": set, "pids": set}
 
-    # Group brand-matched PIDs by brand label.
-    by_brand = {}
-    for pid, ppid, bn in procs:
-        brand = _common.airport_brand_for_name(bn)
-        if brand:
-            by_brand.setdefault(brand, []).append((pid, ppid, bn))
-    if not by_brand:
-        return []
+    for pid, _ppid, comm, path in procs:
+        if _common.name_should_skip(comm):
+            continue
+        broot = _bundle_root_for_path(path)
+        if broot:
+            bundle_of_pid[pid] = broot
+            entry = by_bundle.setdefault(broot, {"comms": set(),
+                                                 "pids": set()})
+            entry["comms"].add(comm)
+            entry["pids"].add(pid)
+        else:
+            entry = standalone.setdefault(comm, {"comms": set(),
+                                                 "pids": set()})
+            entry["comms"].add(comm)
+            entry["pids"].add(pid)
+
+    # Union-find over bundle roots so a parent in bundle B and child in
+    # bundle A are merged into one family.
+    parents_uf = {b: b for b in by_bundle}
+
+    def find(b):
+        while parents_uf[b] != b:
+            parents_uf[b] = parents_uf[parents_uf[b]]
+            b = parents_uf[b]
+        return b
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parents_uf[rb] = ra
+
+    parent_of = {pid: ppid for pid, ppid, _, _ in procs}
+    for pid, _, _, _ in procs:
+        ppid = parent_of.get(pid)
+        a = bundle_of_pid.get(pid)
+        b = bundle_of_pid.get(ppid)
+        if a and b and a != b:
+            # Prefer keeping the /Applications root as canonical so the
+            # label comes from the user-facing app, not the privileged
+            # helper bundle in /Library/PrivilegedHelperTools.
+            if "/Applications/" in a and "/Applications/" not in b:
+                union(a, b)
+            elif "/Applications/" in b and "/Applications/" not in a:
+                union(b, a)
+            else:
+                union(a, b)
+
+    coalesced = {}  # canonical_root -> {"comms": set, "members": set}
+    for b, entry in by_bundle.items():
+        r = find(b)
+        c = coalesced.setdefault(r, {"comms": set(), "members": set()})
+        c["comms"] |= entry["comms"]
+        c["members"].add(b)
 
     families = []
-    for brand, members in by_brand.items():
-        all_pids = set()
-        for pid, ppid, _ in members:
-            all_pids.add(pid)
-            # Pull in the parent if it isn't launchd / a shell — captures
-            # .app launchers whose comm doesn't include a brand keyword.
-            parent_name = name_of.get(ppid)
-            if (ppid > 1 and parent_name
-                    and not _common.name_should_skip(parent_name)):
-                all_pids.add(ppid)
-                for cpid in children.get(ppid, []):
-                    all_pids.add(cpid)
-            for cpid in children.get(pid, []):
-                all_pids.add(cpid)
+    for root, c in coalesced.items():
+        members = c["members"]
+        comms = c["comms"]
+        # Proxy signal 1: any comm in the bundle is a known proxy core.
+        has_core = any(_common.name_looks_like_proxy_core(n) for n in comms)
+        # Proxy signal 2: bundle path or id hints proxy/vpn/etc.
+        bundle_id = _bundle_id_from_plist(root)
+        has_path_hint = (
+            _common.path_hints_proxy_bundle(root)
+            or _common.path_hints_proxy_bundle(bundle_id)
+            or any(_common.path_hints_proxy_bundle(m) for m in members)
+        )
+        # Proxy signal 3: ships a SystemExtension (Karing).
+        has_sysext = any(_has_system_extension(m) for m in members)
+        if not (has_core or has_path_hint or has_sysext):
+            continue
 
-        names = []
-        seen = set()
-        for pid in all_pids:
-            bn = name_of.get(pid)
-            if not bn or _common.name_should_skip(bn):
-                continue
-            key = bn.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            names.append(bn)
-        if names:
-            families.append({"label": brand, "names": names})
+        # Pick the prettiest member as canonical for the label.
+        candidates = sorted(members)
+        preferred = next((m for m in candidates if "/Applications/" in m),
+                         candidates[0])
+        label = _bundle_label_from_path(preferred) or os.path.basename(
+            preferred)
+        families.append({"label": label, "names": sorted(comms)})
+
+    # Standalone bare cores running outside any .app (e.g., a user-installed
+    # /opt/homebrew/bin/mihomo, /usr/local/bin/sing-box).
+    for comm, entry in standalone.items():
+        if _common.name_looks_like_proxy_core(comm):
+            families.append({"label": comm, "names": [comm]})
 
     families.sort(key=lambda f: f["label"].lower())
     return families
@@ -544,60 +758,116 @@ def list_airport_client_families():
     return list_airport_client_families_mac()
 
 
+def _family_for_pid_mac(pid, procs=None):
+    """Resolve `pid` to its airport-client family — i.e., the .app bundle
+    that owns the process, plus all sibling processes inside that bundle
+    and any cross-bundle members linked via parent-child.
+
+    Returns {"label": str, "names": [str, ...]} or None when the PID is
+    no longer running.
+
+    This is the precise version of list_airport_client_families: instead
+    of enumerating every running airport client, we walk back to a single
+    family from a known PID. Used by detect_first_hop_processes after
+    netstat tells us which PID is actually listening on the user's port.
+    """
+    if procs is None:
+        procs = _ps_snapshot_with_path_mac()
+    if not procs:
+        return None
+    by_pid = {p[0]: p for p in procs}
+    target = by_pid.get(pid)
+    if not target:
+        return None
+    _, _, target_comm, target_path = target
+    target_root = _bundle_root_for_path(target_path)
+    if not target_root:
+        # Bare standalone binary (e.g., /opt/homebrew/bin/mihomo). Family
+        # is just itself.
+        return {"label": target_comm, "names": [target_comm]}
+
+    # Build bundle map and union-find over parent-child links to absorb
+    # any helper bundles whose children live inside target_root (or vice
+    # versa). Mirror of the logic in list_airport_client_families_mac.
+    bundle_of = {}
+    for p, _, _, path in procs:
+        b = _bundle_root_for_path(path)
+        if b:
+            bundle_of[p] = b
+    bundle_roots = set(bundle_of.values())
+    parents_uf = {b: b for b in bundle_roots}
+
+    def find(b):
+        while parents_uf[b] != b:
+            parents_uf[b] = parents_uf[parents_uf[b]]
+            b = parents_uf[b]
+        return b
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parents_uf[rb] = ra
+
+    parent_of = {pid: ppid for pid, ppid, _, _ in procs}
+    for p, _, _, _ in procs:
+        ppid = parent_of.get(p)
+        a = bundle_of.get(p)
+        b = bundle_of.get(ppid)
+        if a and b and a != b:
+            union(a, b)
+
+    target_canon = find(target_root)
+    members = {b for b in bundle_roots if find(b) == target_canon}
+
+    comms = set()
+    for p, _, comm, path in procs:
+        b = _bundle_root_for_path(path)
+        if b in members and not _common.name_should_skip(comm):
+            comms.add(comm)
+    if not comms:
+        comms.add(target_comm)
+
+    candidates = sorted(members)
+    preferred = next((m for m in candidates if "/Applications/" in m),
+                     candidates[0])
+    label = _bundle_label_from_path(preferred) or os.path.basename(preferred)
+    return {"label": label, "names": sorted(comms)}
+
+
 def detect_first_hop_processes(host, port):
     """See _windows.detect_first_hop_processes — same contract.
 
-    Tries lsof first (works when listener is owned by current user). On a
-    miss, falls back to a SOCKS5 handshake + airport-client process scan.
-    The fallback path returns names from a SINGLE family if exactly one is
-    running; if multiple distinct families are found, the GUI should call
-    `list_airport_client_families` and let the user disambiguate.
+    Resolves the PID listening on host:port and returns just THAT
+    process's family (the .app bundle's siblings), not every airport
+    client running on the machine. Resolution order:
+      1. lsof — fast path for user-owned listeners.
+      2. netstat -anvp tcp — sees ROOT-owned listeners too (the FastLink/
+         Clash Verge / 猫猫云 case), no sudo required.
+      3. SOCKS5 handshake — if both PID-resolvers fail but a proxy
+         IS responding, return [] so the caller can fall back to a
+         disambiguating chooser via list_airport_client_families.
     """
     if host not in ("127.0.0.1", "localhost", "::1"):
         return []
-    pid = _listening_pid_lsof(port)
+    pid = (_listening_pid_lsof(port)
+           or _listening_pid_netstat_mac(host, port))
     if pid:
-        names = []
-        seen = set()
+        # Walk to the PID's bundle and return that single family. This is
+        # what makes the auto-detect button "find FastLink, ignore the
+        # other 4 airport clients also running" instead of dumping
+        # everything into the whitelist.
+        fam = _family_for_pid_mac(pid)
+        if fam and fam["names"]:
+            return fam["names"]
+        # PID resolved but bundle walk found nothing usable — fall back
+        # to comm-only return.
+        comm, _ = _proc_info_mac(pid)
+        return [comm] if comm else []
 
-        def push(name):
-            if not name:
-                return
-            key = name.lower()
-            if key in seen:
-                return
-            seen.add(key)
-            names.append(name)
-
-        self_name, ppid = _proc_info_mac(pid)
-        push(self_name)
-        if ppid and ppid > 1:  # 1 = launchd
-            parent_name, _ = _proc_info_mac(ppid)
-            # Skip launcher shells / launchd children — not the airport client.
-            if parent_name and parent_name.lower() not in (
-                    "launchd", "bash", "zsh", "sh", "login", "terminal"):
-                push(parent_name)
-                for n in _children_names_mac(ppid):
-                    push(n)
-        for n in _children_names_mac(pid):
-            push(n)
-        return names
-
-    # lsof saw nobody. Listener is likely root-owned (FastLink spawns
-    # AtlasCore as root, Clash Verge's verge-mihomo runs as root, etc.).
-    # SOCKS5 handshake confirms a real proxy is there; fall through to the
-    # name-pattern family scan.
+    # No PID resolution succeeded. Confirm via SOCKS5 that something is
+    # there at all; if so, signal ambiguity to the caller.
     if not _common.socks5_handshake_succeeds(host, port):
         return []
-    families = list_airport_client_families_mac()
-    if not families:
-        return []
-    if len(families) == 1:
-        return families[0]["names"]
-    # Multiple airport clients running. Be conservative: return [] so the
-    # caller (GUI) recognizes ambiguity and asks the user. Returning an
-    # over-broad union here was the bug that caused FastLink whitelists to
-    # accidentally include unrelated Clash Verge / Mihomo Party processes.
     return []
 
 
