@@ -113,30 +113,110 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
   auto-detect 按 .app bundle 路径分组，废弃品牌列表路径）→ 1.1.10（GUI fix：rule-set
   picker 不再被裁，combo 滚轮事件统一忽略）
 
-## Windows 1.1.10 打包（无需改任何代码）
+## Windows 1.1.10 打包（给 Windows 上的 Claude Code 自动执行）
 
-源码 fix 已通过共享 `chainproxy_qt.py` 同步到 main；installer 版本号已 bump 到 1.1.10。
-在 Windows 机器上执行：
+> **触发方式**：用户在 Windows 机器的 ChainProxy 目录下打开 Claude Code，说一句
+> "按 CLAUDE.md 的 Windows 1.1.10 打包流程做"。Claude Code 自动读这一段并执行。
+> 用户不应该被要求自己跑命令——所有命令由 Claude Code 用 Bash/PowerShell 工具调起。
+
+源码 fix 已经在 main（`chainproxy_qt.py` 跨平台共享 + `scripts/installer.iss`
+`MyAppVersion` 已 bump 到 1.1.10），无需改任何代码，纯 build + upload。
+
+### Step 0：拉最新 main
 
 ```powershell
-# 1. 拉最新代码
-git pull
-
-# 2. 一键构建 mihomo 捆绑 + PyInstaller .exe + Inno Setup 安装器
-powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
-
-# 产物：
-#   dist\ChainProxy\ChainProxy.exe      ← 解压版（可直接跑）
-#   dist\ChainProxy-Setup-1.1.10.exe    ← 安装器（要发布的）
-
-# 3. 上传到已存在的 v1.1.10 release（macOS DMG 已挂在那里）
-gh release upload v1.1.10 dist\ChainProxy-Setup-1.1.10.exe
+git fetch origin
+git checkout main
+git pull --ff-only origin main
 ```
 
-**验证 GUI 修复**（开任意 ChainProxy.exe，进入「分流规则」页）：
-- 内置规则集表格里的「命中后」下拉框，下边圆角不再被裁
-- 把规则切到 `FirstHopOnly`，文字「y」必须完整显示，不能被截
-- 鼠标悬停在下拉框上滚动滚轮，**值不能变**（必须点击下拉才能改）
+`git log --oneline -3` 应该能看到 `dd82936 docs:` 和 `3a56c80 fix(ui):`。
+
+### Step 1：前置依赖自检 + 缺啥装啥（**Claude Code 自己装，别让用户装**）
+
+用 Bash 工具执行以下检查，缺哪个补哪个：
+
+```powershell
+# Python 3.10+ —— 看 `py --version` 或 `python --version`
+py --version
+# 缺：winget install Python.Python.3.12 --silent
+
+# pip 包 —— 一次装齐
+py -m pip install --upgrade pip
+py -m pip install PyQt6 pywin32 Pillow pyinstaller
+
+# Inno Setup 6 —— 出安装器必需
+where iscc.exe 2>$null
+# 缺：winget install JRSoftware.InnoSetup --silent
+# 装完 winget 不会自动加 PATH，build_windows.ps1 会去 "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+# 和 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" 找，所以装完不需要重启 shell
+
+# gh CLI —— upload release 必需
+gh --version
+# 缺：winget install GitHub.cli --silent
+# 装完检查认证：gh auth status；没认证就 gh auth login（会跳浏览器）
+```
+
+> 如果 `winget` 自身缺失（罕见，老 Windows），告诉用户从 Microsoft Store 装
+> "App Installer"，然后重试。
+
+### Step 2：跑构建脚本
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+```
+
+脚本输出预期 6 个阶段（==[1/6]== ... ==[6/6]==）。常见错误及处理：
+
+| 错误 | 原因 | 处理 |
+|---|---|---|
+| `py is not recognized` | Python 没装或没在 PATH | Step 1 装 Python 后**新开 PowerShell** 重试（PATH 需要新会话） |
+| `ModuleNotFoundError: PyQt6` | pip 包缺 | `py -m pip install PyQt6 pywin32 Pillow pyinstaller` |
+| `mihomo zip did not contain an .exe` 或下载超时 | GitHub 限速/网络 | 重试一次；持续失败就手动从 https://github.com/MetaCubeX/mihomo/releases 下 `mihomo-windows-amd64-compatible-v1.19.24.zip` 解压出 `mihomo.exe` 放到 `scripts\mihomo.exe` 再重跑 |
+| `Inno Setup not found` 警告 | iscc.exe 没装也没在标准路径 | 装 InnoSetup 后重跑（脚本不会因此 throw，会跳过安装器步骤继续退出，所以**必须看到第 6 阶段输出 `DONE. Installer:` 那行**才算成功） |
+| Inno Setup 编译报 `Unknown identifier "ChineseSimplified"` | 简中语言文件没下到 | 脚本会自动从 jrsoftware/issrc 拉，失败时降级为英文。可以手动从 https://github.com/jrsoftware/issrc/raw/main/Files/Languages/Unofficial/ChineseSimplified.isl 下载放到 `<InnoSetupDir>\Languages\` 后重跑 |
+
+成功时产出：
+
+- `dist\ChainProxy\ChainProxy.exe` —— 解压版（可直接双击跑，含全部依赖）
+- `dist\ChainProxy-Setup-1.1.10.exe` —— Inno Setup 安装器（要发布的那个）
+
+### Step 3：headless smoke test（不需要 GUI 也能跑）
+
+不要直接 `start` exe（会卡住等用户关），用 timeout 启动后立即关：
+
+```powershell
+# 启动后等 3 秒看是否 crash，没崩就 kill
+$p = Start-Process -FilePath "dist\ChainProxy\ChainProxy.exe" -PassThru
+Start-Sleep -Seconds 3
+if ($p.HasExited) {
+    Write-Error "ChainProxy.exe exited within 3s, code=$($p.ExitCode) — build is broken"
+    exit 1
+}
+Stop-Process -Id $p.Id -Force
+Write-Host "OK: ChainProxy.exe started cleanly"
+```
+
+如果 crash，看 `%APPDATA%\ChainProxy\app.log` 找原因。常见是 `mihomo.exe` 没被
+PyInstaller 打包进去——确认 `dist\ChainProxy\mihomo.exe` 存在。
+
+### Step 4：上传到现有的 v1.1.10 release（macOS DMG 已经挂在那里）
+
+```powershell
+gh release upload v1.1.10 dist\ChainProxy-Setup-1.1.10.exe --clobber
+```
+
+`--clobber` 防止重传时报"asset 已存在"。
+
+### Step 5：告诉用户验证 GUI（这步只能用户做）
+
+Claude Code 完成 1-4 后，告诉用户：
+
+> Windows 1.1.10 安装包已发布到 https://github.com/Laogeyouge/ChainProxy/releases/tag/v1.1.10。
+> 请装一下（卸载旧版后双击 `ChainProxy-Setup-1.1.10.exe`），开「分流规则」页验证 3 点：
+> 1. 内置规则集表格的「命中后」下拉框，下边圆角不被行分割线裁切
+> 2. 切到 `FirstHopOnly`，"y" 完整显示
+> 3. 鼠标悬停下拉框上滚滚轮，值不能变（必须点开下拉再选）
 
 ## 1.1.8 改动清单（核心）
 
