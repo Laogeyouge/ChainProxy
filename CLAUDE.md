@@ -89,23 +89,21 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
 
 ## 当前状态（2026-05-10）
 
-- ✅ **Windows 1.1.13 已发布**——修了"X-按钮收托盘 → 托盘退出"后 ChainProxy.exe 残留
-  在 Task Manager 的 bug。根因：Qt 的 `quitOnLastWindowClosed=True` 只在 visible→关闭
-  转移时触发，对一个**已经 hidden**的 MainWindow 调 `e.accept()` 不算"关闭最后一个
-  可见窗口"，于是 `app.exec()` 永不返回。修法：closeEvent 显式退出分支末尾加一行
-  `self.q_app.quit()`。Drive-by：删冗余的"确认退出"对话框（hidden parent 在 Win11
-  渲染不可靠），closeEvent 同步跑 `_final_cleanup` 而不是依赖 aboutToQuit；MihomoRunner
-  Windows 路径下 UAC 取消时不再把 `uac_pid` 误清空；新增 `core.kill_orphan_mihomo`
-  作为 `_final_cleanup` 的非 UAC 兜底扫。bug 是用一次性的 exit-trace 诊断工具定位的，
-  trace 已随定位完成移除。**macOS 1.1.13 待打包**——closeEvent + final_cleanup 改动
-  跨平台共享，需要一台 Mac 跑 `bash scripts/build.sh && bash scripts/make_dmg.sh 1.1.13`。
+- ✅ **1.1.13 已发布（Windows + macOS）**——修了 Windows 下"X-按钮收托盘 → 托盘退出"后
+  ChainProxy.exe 残留在 Task Manager 的 bug。根因：Qt 的 `quitOnLastWindowClosed=True`
+  只在 visible→关闭转移时触发，对一个**已经 hidden** 的 MainWindow 调 `e.accept()`
+  不算"关闭最后一个可见窗口"，于是 `app.exec()` 永不返回。修法：closeEvent 显式退出
+  分支末尾加一行 `self.q_app.quit()`。Drive-by：删冗余的"确认退出"对话框（hidden parent
+  在 Win11 渲染不可靠），closeEvent 同步跑 `_final_cleanup` 而不是依赖 aboutToQuit；
+  MihomoRunner Windows 路径下 UAC 取消时不再把 `uac_pid` 误清空；新增
+  `core.kill_orphan_mihomo` 作为 `_final_cleanup` 的非 UAC 兜底扫。bug 是用一次性的
+  exit-trace 诊断工具定位的，trace 已随定位完成移除。macOS DMG 直接复用 1.1.10 内容
+  改名上传（macOS 路径未触发该 bug，无需重打包）。
 - ✅ **macOS 1.1.10 已发布**（DMG 在 release v1.1.10）——分流规则页「命中后」combo 的
   三个 GUI bug 一次性修：(a) 直接 setCellWidget 取代 wrap+layout，QTableWidget 强制
   combo 尺寸 = cell rect，QSS `border-radius` 不可能溢出 cell 被裁；(b) 列宽 140 → 180，
   「FirstHopOnly」完整显示；(c) 新增 `NoWheelComboBox`（继承 QComboBox 把 wheelEvent
   ignore 掉）防滚轮误触，应用到 RulesPage 的两个 combo。
-- ✅ **Windows 1.1.10 已发布**（双击托盘菜单项时 commit ad78076 起会有这版的 fix；
-  当 1.1.13 cover 1.1.10 的所有改动）。
 - ✅ Windows 1.1.9 工程完成 + 真机验证通过（brand chooser、`.exe` 后缀剥除、conhost/svchost
   噪音过滤、旧版残留自动清理）；安装器 `dist\ChainProxy-Setup-1.1.9.exe` 已打包并发 release
 - ✅ macOS 1.1.9 已发布——彻底放弃品牌列表，改为 **`netstat -anvp tcp` 拿 listener PID
