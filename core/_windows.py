@@ -707,6 +707,30 @@ def panic_recover(log_cb):
     log_cb("==================")
 
 
+def kill_orphan_mihomo(log_cb):
+    """Best-effort cleanup of any leftover mihomo.exe at app exit. Used by
+    _final_cleanup as a safety net after the runner's own stop() path. Does
+    NOT pop UAC — exit-time prompts are jarring and easy to miss. If the
+    orphan is elevated and we aren't, we just log and give up; the user
+    can run 网络急救 from a fresh GUI session to take care of it."""
+    try:
+        r = subprocess.run(
+            ["taskkill", "/F", "/T", "/IM", "mihomo.exe"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        out = (r.stdout or r.stderr or "").strip()
+        # taskkill exits 128 when no matching process exists — the common
+        # happy case (runner.stop already killed it). Don't log noise for
+        # that, but do log access-denied so the bug is visible in app.log.
+        if r.returncode == 0:
+            log_cb(f"orphan sweep: {out}")
+        elif "access is denied" in out.lower() or "拒绝访问" in out:
+            log_cb("orphan sweep: 残留 mihomo 已提权，未杀（避免在退出时弹 UAC）")
+    except Exception as e:
+        log_cb(f"orphan sweep failed: {e}")
+
+
 def bounce_primary_interface(log_cb):
     """Windows stub. macOS-specific recovery; Windows handles sleep/wake at
     the OS level differently (NDIS reset on resume) and we have no equivalent
@@ -964,14 +988,21 @@ class MihomoRunner:
                 if not self._pid_alive(self.uac_pid):
                     break
                 time.sleep(0.1)
-            self.uac_pid = None
-            if self._uac_handle:
-                try:
-                    ctypes.windll.kernel32.CloseHandle(self._uac_handle)
-                except Exception:
-                    pass
-                self._uac_handle = None
-            self.log_cb("mihomo stopped (elevated)")
+            # Only forget the PID if mihomo actually died. Previously this
+            # cleared unconditionally, so a cancelled UAC prompt left mihomo
+            # alive but invisible to the runner — _final_cleanup couldn't
+            # see it either, and the user found mihomo still in Task Manager.
+            if self._pid_alive(self.uac_pid):
+                self.log_cb(f"mihomo (pid={self.uac_pid}) 仍在运行 — UAC 取消或 taskkill 失败")
+            else:
+                self.uac_pid = None
+                if self._uac_handle:
+                    try:
+                        ctypes.windll.kernel32.CloseHandle(self._uac_handle)
+                    except Exception:
+                        pass
+                    self._uac_handle = None
+                self.log_cb("mihomo stopped (elevated)")
 
     def _stop_via_controller(self):
         """Ask mihomo to exit cleanly via its external-controller REST API.
@@ -1143,7 +1174,8 @@ __all__ = [
     "seed_geodata", "detect_first_hop_processes",
     "list_airport_client_families", "name_should_skip",
     "tcp_reachable", "test_url_through_proxy",
-    "set_system_proxy", "panic_recover", "bounce_primary_interface",
+    "set_system_proxy", "panic_recover", "kill_orphan_mihomo",
+    "bounce_primary_interface",
     "refresh_system_proxy",
     "atomic_write_text",
     "MihomoRunner",

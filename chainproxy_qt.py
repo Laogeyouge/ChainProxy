@@ -35,6 +35,63 @@ from PyQt6.QtWidgets import (
 import chainproxy_core as core
 
 
+# ─── Exit-chain diagnostic trace ───────────────────────────────────────────
+# Logs every step of the shutdown sequence to %APPDATA%\ChainProxy\
+# exit-trace.log (or ~/Library/.../ on macOS). Writes are flushed + fsync'd
+# so a hang anywhere in the chain still leaves a complete record up to the
+# blocking point. Cheap enough to leave in production builds — only writes
+# during exit, not during normal use.
+
+_EXIT_TRACE_INITIALIZED = False
+
+def _exit_trace(stage: str, **fields):
+    global _EXIT_TRACE_INITIALIZED
+    try:
+        log_path = core.SUPPORT_DIR / "exit-trace.log"
+        # First call in a session: rotate previous trace to .prev so we
+        # don't accumulate forever, and stamp a header.
+        if not _EXIT_TRACE_INITIALIZED:
+            _EXIT_TRACE_INITIALIZED = True
+            try:
+                if log_path.exists():
+                    prev = log_path.with_suffix(".log.prev")
+                    try: prev.unlink()
+                    except (OSError, FileNotFoundError): pass
+                    try: log_path.rename(prev)
+                    except OSError: pass
+            except Exception:
+                pass
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        ms = int((time.time() % 1) * 1000)
+        threads = threading.enumerate()
+        try:
+            tops = QApplication.topLevelWidgets()
+            tw_count = len(tops)
+            tw_quit_on_close = sum(1 for t in tops
+                if t.testAttribute(Qt.WidgetAttribute.WA_QuitOnClose)
+                and t.isVisible())
+        except Exception:
+            tw_count = -1
+            tw_quit_on_close = -1
+        kv = " ".join(f"{k}={v}" for k, v in fields.items())
+        line = (f"{ts}.{ms:03d} pid={os.getpid()} tid={threading.get_ident()} "
+                f"stage={stage} threads={len(threads)} "
+                f"top_widgets={tw_count} visible_quit_on_close={tw_quit_on_close} "
+                f"{kv}")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            for t in threads:
+                f.write(f"  T: {t.name} daemon={t.daemon} alive={t.is_alive()}\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except Exception:
+        # Never let diagnostics break exit
+        pass
+
+
 # ─── Color palette (Apple-inspired, semantic) ──────────────────────────────
 
 LIGHT = {
@@ -2929,34 +2986,59 @@ class MainWindow(QMainWindow):
         finds Wi-Fi 'broken' until they reboot or manually kill mihomo.
         Idempotent: the gate flag guards against running twice when more
         than one exit hook fires."""
+        _exit_trace("final_cleanup.entry",
+                    done=self._final_cleanup_done,
+                    runner_running=self.runner.is_running(),
+                    we_set_proxy=getattr(self, "_we_set_proxy", False))
         if self._final_cleanup_done:
+            _exit_trace("final_cleanup.skip_dup")
             return
         self._final_cleanup_done = True
         self._intentional_stop = True
         try:
             if self.runner.is_running():
+                _exit_trace("final_cleanup.runner_stop.begin")
                 self.runner.stop()
-        except Exception:
-            pass
+                _exit_trace("final_cleanup.runner_stop.done")
+        except Exception as e:
+            _exit_trace("final_cleanup.runner_stop.error", err=repr(e))
         try:
             if getattr(self, "_we_set_proxy", False):
+                _exit_trace("final_cleanup.proxy_clear.begin")
                 core.set_system_proxy(0, enable=False)
-        except Exception:
-            pass
-        # macOS TUN: helper recover wipes routes/utun even if runner.stop
-        # already did so (defensive — we don't want a dead utun4 to outlive
-        # us). Pass a no-op log so we don't try to write to a Qt UI that's
-        # in the middle of tearing down.
+                _exit_trace("final_cleanup.proxy_clear.done")
+        except Exception as e:
+            _exit_trace("final_cleanup.proxy_clear.error", err=repr(e))
+        # Orphan sweep: belt-and-suspenders kill of any mihomo.exe / mihomo
+        # we may have lost track of. Common Windows path: TUN-mode UAC
+        # prompt was cancelled, the runner cleared uac_pid, mihomo kept
+        # running. Without this, the user lands in Task Manager wondering
+        # why mihomo is still there. Pass a no-op log so we don't try to
+        # write to a Qt UI that's mid-teardown.
         if sys.platform == "darwin" and self.cfg.get("tun_mode"):
             try:
+                _exit_trace("final_cleanup.panic_recover.begin")
                 core.panic_recover(lambda *_a, **_kw: None)
-            except Exception:
-                pass
+                _exit_trace("final_cleanup.panic_recover.done")
+            except Exception as e:
+                _exit_trace("final_cleanup.panic_recover.error", err=repr(e))
+        elif sys.platform == "win32":
+            try:
+                _exit_trace("final_cleanup.orphan_sweep.begin")
+                core.kill_orphan_mihomo(lambda *_a, **_kw: None)
+                _exit_trace("final_cleanup.orphan_sweep.done")
+            except Exception as e:
+                _exit_trace("final_cleanup.orphan_sweep.error", err=repr(e))
+        _exit_trace("final_cleanup.exit")
 
     def closeEvent(self, e):
+        _exit_trace("closeEvent.entry",
+                    tray_quit=self._tray_quit,
+                    tray_visible=bool(self.tray and self.tray.isVisible()))
         # Closing the window without an explicit quit minimizes to the tray
         # so the proxy keeps running. Hide rather than terminate.
         if self.tray and self.tray.isVisible() and not self._tray_quit:
+            _exit_trace("closeEvent.minimize_to_tray")
             e.ignore()
             self.hide()
             # First time: tell the user where the app went, otherwise people
@@ -2972,24 +3054,29 @@ class MainWindow(QMainWindow):
                     pass
             return
 
-        # Real quit: stop mihomo, restore proxy, close.
-        if self.runner.is_running():
-            r = QMessageBox.question(self, "退出",
-                "代理仍在运行。退出会停止代理。继续？")
-            if r != QMessageBox.StandardButton.Yes:
-                e.ignore()
-                self._tray_quit = False  # cancel: don't quit, but don't hide either
-                return
-            self._intentional_stop = True
-            try: self.runner.stop()
-            except Exception: pass
-            if self._we_set_proxy:
-                self.toggle_system_proxy(False)
-            if self.cfg.get("tun_mode"):
-                core.panic_recover(self.log)
+        # Explicit quit (tray menu / Ctrl+Q). Skip the old "are you sure"
+        # confirmation — its modal dialog with a hidden parent rendered
+        # unreliably on Win11 and silently swallowed quits.
+        #
+        # Run cleanup synchronously here (don't wait for aboutToQuit) so
+        # mihomo is dead and proxy is restored before we accept the close.
+        # Then arm a hard-exit fallback: if the orderly Qt → main() →
+        # interpreter shutdown hasn't finished in 1.5s, os._exit(0) kills
+        # the process. Without this, ChainProxy.exe was lingering in Task
+        # Manager after tray-quit (some thread or handle blocking interp
+        # exit, exact cause varied across runs).
+        _exit_trace("closeEvent.explicit_quit")
+        try:
+            self._final_cleanup()
+        except Exception as e2:
+            _exit_trace("closeEvent.cleanup_error", err=repr(e2))
+        _exit_trace("closeEvent.cleanup_done")
         if self.tray:
+            _exit_trace("closeEvent.tray_hide.begin")
             self.tray.hide()
+            _exit_trace("closeEvent.tray_hide.done")
         e.accept()
+        _exit_trace("closeEvent.accepted")
 
 
 # ─── Entry ─────────────────────────────────────────────────────────────────
@@ -3082,8 +3169,16 @@ def main():
     # running and the TUN routes hijacking 198.18.0.1 — the user reboots
     # and the network is "broken" until manual intervention.
     import atexit
-    app.aboutToQuit.connect(w._final_cleanup)
-    atexit.register(w._final_cleanup)
+    def _on_about_to_quit():
+        _exit_trace("aboutToQuit.fired")
+        w._final_cleanup()
+        _exit_trace("aboutToQuit.cleanup_returned")
+    def _on_atexit():
+        _exit_trace("atexit.fired")
+        w._final_cleanup()
+        _exit_trace("atexit.cleanup_returned")
+    app.aboutToQuit.connect(_on_about_to_quit)
+    atexit.register(_on_atexit)
     if sys.platform != "win32":
         import signal
         def _on_term_signal(_signum, _frame):
@@ -3099,12 +3194,27 @@ def main():
     w.show()
     w.raise_()
     w.activateWindow()
+    _exit_trace("main.entering_app_exec")
     try:
-        sys.exit(app.exec())
+        rc = app.exec()
+        _exit_trace("main.app_exec_returned", rc=rc)
+        sys.exit(rc)
     finally:
+        _exit_trace("main.finally.begin")
         try: lock.close()
         except Exception: pass
+        _exit_trace("main.finally.lock_closed")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        _exit_trace("module.main_returned_normally")
+    except SystemExit as _se:
+        _exit_trace("module.SystemExit", code=_se.code)
+        raise
+    except BaseException as _be:
+        _exit_trace("module.unhandled_exception", err=repr(_be))
+        raise
+    finally:
+        _exit_trace("module.finally")
