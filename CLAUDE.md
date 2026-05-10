@@ -87,8 +87,18 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
 - 不要弹"我做了 X"的总结，用户自己看 diff
 - 节点信息绝对不能进 git（仓库已脱敏，`.gitignore` 里有 `config.json`）
 
-## 当前状态（2026-05-09）
+## 当前状态（2026-05-10）
 
+- ✅ **macOS 1.1.10 已发布**（DMG 在 release v1.1.10）——分流规则页「命中后」combo 的
+  三个 GUI bug 一次性修：(a) 直接 setCellWidget 取代 wrap+layout，QTableWidget 强制
+  combo 尺寸 = cell rect，QSS `border-radius` 不可能溢出 cell 被裁；(b) 列宽 140 → 180，
+  「FirstHopOnly」完整显示；(c) 新增 `NoWheelComboBox`（继承 QComboBox 把 wheelEvent
+  ignore 掉）防滚轮误触，应用到 RulesPage 的两个 combo。
+- ⏳ **Windows 1.1.10 待打包发布**——源码已就绪（`chainproxy_qt.py` 是跨平台共享单文件，
+  fix 已 push 到 main；`scripts/installer.iss` 的 `MyAppVersion` 已 bump 到 1.1.10）。
+  在 Windows 机器上：`git pull` → `powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1`
+  → 产物 `dist\ChainProxy-Setup-1.1.10.exe` 上传到现有 v1.1.10 release（`gh release
+  upload v1.1.10 dist\ChainProxy-Setup-1.1.10.exe`）。详见下方「Windows 1.1.10 打包」。
 - ✅ Windows 1.1.9 工程完成 + 真机验证通过（brand chooser、`.exe` 后缀剥除、conhost/svchost
   噪音过滤、旧版残留自动清理）；安装器 `dist\ChainProxy-Setup-1.1.9.exe` 已打包并发 release
 - ✅ macOS 1.1.9 已发布——彻底放弃品牌列表，改为 **`netstat -anvp tcp` 拿 listener PID
@@ -100,7 +110,33 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
   bundle + auto-detect button） → 1.1.8（brand-grouped chooser、SOCKS5 探测兜底、helper
   版本号修复、`<defunct>` 过滤、配置 `.bak` 备份；macOS DMG 已打但未发，被 1.1.9 取代）→
   1.1.9（Windows: `.exe` 后缀、shell 噪音过滤、自动清理旧版残留；macOS: netstat-driven
-  auto-detect 按 .app bundle 路径分组，废弃品牌列表路径）
+  auto-detect 按 .app bundle 路径分组，废弃品牌列表路径）→ 1.1.10（GUI fix：rule-set
+  picker 不再被裁，combo 滚轮事件统一忽略）
+
+## Windows 1.1.10 打包（无需改任何代码）
+
+源码 fix 已通过共享 `chainproxy_qt.py` 同步到 main；installer 版本号已 bump 到 1.1.10。
+在 Windows 机器上执行：
+
+```powershell
+# 1. 拉最新代码
+git pull
+
+# 2. 一键构建 mihomo 捆绑 + PyInstaller .exe + Inno Setup 安装器
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+
+# 产物：
+#   dist\ChainProxy\ChainProxy.exe      ← 解压版（可直接跑）
+#   dist\ChainProxy-Setup-1.1.10.exe    ← 安装器（要发布的）
+
+# 3. 上传到已存在的 v1.1.10 release（macOS DMG 已挂在那里）
+gh release upload v1.1.10 dist\ChainProxy-Setup-1.1.10.exe
+```
+
+**验证 GUI 修复**（开任意 ChainProxy.exe，进入「分流规则」页）：
+- 内置规则集表格里的「命中后」下拉框，下边圆角不再被裁
+- 把规则切到 `FirstHopOnly`，文字「y」必须完整显示，不能被截
+- 鼠标悬停在下拉框上滚动滚轮，**值不能变**（必须点击下拉才能改）
 
 ## 1.1.8 改动清单（核心）
 
