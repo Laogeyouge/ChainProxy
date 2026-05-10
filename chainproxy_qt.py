@@ -558,6 +558,13 @@ class ChainNode(QFrame):
         self.meta_lbl.setText(meta)
 
 
+class NoWheelComboBox(QComboBox):
+    """QComboBox that ignores mouse wheel — must click to change value.
+    Why: hover-wheel changes are very easy to trigger by accident."""
+    def wheelEvent(self, ev):
+        ev.ignore()
+
+
 class Arrow(QWidget):
     """A simple horizontal arrow drawn with QPainter."""
     def __init__(self, color: str = "#a1a1a6"):
@@ -1323,7 +1330,7 @@ class RulesPage(QWidget):
         self.enable_chk.setChecked(bool(app.cfg.get("rules_enabled")))
         self.enable_chk.toggled.connect(self._on_enable_toggle)
 
-        self.final_combo = QComboBox()
+        self.final_combo = NoWheelComboBox()
         self.final_combo.addItems([t for t in core.RULE_TARGETS if t != "REJECT"])
         self.final_combo.setCurrentText(app.cfg.get("final_target", "FirstHopOnly"))
         self.final_combo.setMinimumWidth(160)
@@ -1388,7 +1395,7 @@ class RulesPage(QWidget):
         h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.tbl.setColumnWidth(0, 56)
         self.tbl.setColumnWidth(1, 130)
-        self.tbl.setColumnWidth(2, 140)
+        self.tbl.setColumnWidth(2, 180)
         self.tbl.setColumnWidth(3, 80)
         self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1396,7 +1403,7 @@ class RulesPage(QWidget):
         self.tbl.setAlternatingRowColors(True)
         self.tbl.setShowGrid(False)
         self.tbl.setMinimumHeight(280)
-        self.tbl.verticalHeader().setDefaultSectionSize(36)
+        self.tbl.verticalHeader().setDefaultSectionSize(44)
 
         builtin_card = card(
             hbox(L("内置规则集", "cardTitle"), "stretch",
@@ -1497,17 +1504,16 @@ class RulesPage(QWidget):
         name_item.setFont(mono_font)
         self.tbl.setItem(i, 1, name_item)
 
-        # Column 2: target combo (inline editable)
-        combo = QComboBox()
+        # Column 2: target combo (inline editable). Set as cellWidget directly
+        # so QTableWidget.setGeometry forces it to fill the cell rect — that
+        # way the QSS border-radius cannot draw outside the cell and get clipped
+        # by the row separator.
+        combo = NoWheelComboBox()
         combo.addItems(core.RULE_TARGETS)
         combo.setCurrentText(rs.get("target", "Chain"))
         combo.currentTextChanged.connect(
             lambda txt, idx=i: self._on_row_target(idx, txt))
-        wrap = QWidget()
-        wlay = QHBoxLayout(wrap)
-        wlay.setContentsMargins(4, 2, 4, 2)
-        wlay.addWidget(combo)
-        self.tbl.setCellWidget(i, 2, wrap)
+        self.tbl.setCellWidget(i, 2, combo)
 
         # Column 3: behavior
         beh_item = QTableWidgetItem(rs.get("behavior", "?"))
