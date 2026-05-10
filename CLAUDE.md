@@ -89,16 +89,23 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
 
 ## 当前状态（2026-05-10）
 
+- ✅ **Windows 1.1.13 已发布**——修了"X-按钮收托盘 → 托盘退出"后 ChainProxy.exe 残留
+  在 Task Manager 的 bug。根因：Qt 的 `quitOnLastWindowClosed=True` 只在 visible→关闭
+  转移时触发，对一个**已经 hidden**的 MainWindow 调 `e.accept()` 不算"关闭最后一个
+  可见窗口"，于是 `app.exec()` 永不返回。修法：closeEvent 显式退出分支末尾加一行
+  `self.q_app.quit()`。Drive-by：删冗余的"确认退出"对话框（hidden parent 在 Win11
+  渲染不可靠），closeEvent 同步跑 `_final_cleanup` 而不是依赖 aboutToQuit；MihomoRunner
+  Windows 路径下 UAC 取消时不再把 `uac_pid` 误清空；新增 `core.kill_orphan_mihomo`
+  作为 `_final_cleanup` 的非 UAC 兜底扫。bug 是用一次性的 exit-trace 诊断工具定位的，
+  trace 已随定位完成移除。**macOS 1.1.13 待打包**——closeEvent + final_cleanup 改动
+  跨平台共享，需要一台 Mac 跑 `bash scripts/build.sh && bash scripts/make_dmg.sh 1.1.13`。
 - ✅ **macOS 1.1.10 已发布**（DMG 在 release v1.1.10）——分流规则页「命中后」combo 的
   三个 GUI bug 一次性修：(a) 直接 setCellWidget 取代 wrap+layout，QTableWidget 强制
   combo 尺寸 = cell rect，QSS `border-radius` 不可能溢出 cell 被裁；(b) 列宽 140 → 180，
   「FirstHopOnly」完整显示；(c) 新增 `NoWheelComboBox`（继承 QComboBox 把 wheelEvent
   ignore 掉）防滚轮误触，应用到 RulesPage 的两个 combo。
-- ⏳ **Windows 1.1.10 待打包发布**——源码已就绪（`chainproxy_qt.py` 是跨平台共享单文件，
-  fix 已 push 到 main；`scripts/installer.iss` 的 `MyAppVersion` 已 bump 到 1.1.10）。
-  在 Windows 机器上：`git pull` → `powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1`
-  → 产物 `dist\ChainProxy-Setup-1.1.10.exe` 上传到现有 v1.1.10 release（`gh release
-  upload v1.1.10 dist\ChainProxy-Setup-1.1.10.exe`）。详见下方「Windows 1.1.10 打包」。
+- ✅ **Windows 1.1.10 已发布**（双击托盘菜单项时 commit ad78076 起会有这版的 fix；
+  当 1.1.13 cover 1.1.10 的所有改动）。
 - ✅ Windows 1.1.9 工程完成 + 真机验证通过（brand chooser、`.exe` 后缀剥除、conhost/svchost
   噪音过滤、旧版残留自动清理）；安装器 `dist\ChainProxy-Setup-1.1.9.exe` 已打包并发 release
 - ✅ macOS 1.1.9 已发布——彻底放弃品牌列表，改为 **`netstat -anvp tcp` 拿 listener PID
@@ -111,16 +118,17 @@ gh release create v1.0.2 dist/ChainProxy-1.0.2.dmg --title "ChainProxy 1.0.2" --
   版本号修复、`<defunct>` 过滤、配置 `.bak` 备份；macOS DMG 已打但未发，被 1.1.9 取代）→
   1.1.9（Windows: `.exe` 后缀、shell 噪音过滤、自动清理旧版残留；macOS: netstat-driven
   auto-detect 按 .app bundle 路径分组，废弃品牌列表路径）→ 1.1.10（GUI fix：rule-set
-  picker 不再被裁，combo 滚轮事件统一忽略）
+  picker 不再被裁，combo 滚轮事件统一忽略）→ 1.1.13（Windows: tray-quit 进程残留 fix +
+  Win11 confirmation dialog 删除 + UAC 取消 PID 跟踪修复 + orphan sweep）
 
-## Windows 1.1.10 打包（给 Windows 上的 Claude Code 自动执行）
+## Windows 打包流程（给 Windows 上的 Claude Code 自动执行）
 
 > **触发方式**：用户在 Windows 机器的 ChainProxy 目录下打开 Claude Code，说一句
-> "按 CLAUDE.md 的 Windows 1.1.10 打包流程做"。Claude Code 自动读这一段并执行。
+> "按 CLAUDE.md 的 Windows 打包流程做"。Claude Code 自动读这一段并执行。
 > 用户不应该被要求自己跑命令——所有命令由 Claude Code 用 Bash/PowerShell 工具调起。
 
-源码 fix 已经在 main（`chainproxy_qt.py` 跨平台共享 + `scripts/installer.iss`
-`MyAppVersion` 已 bump 到 1.1.10），无需改任何代码，纯 build + upload。
+发版前先确认 `scripts/installer.iss` 的 `MyAppVersion` 已 bump 到目标版本（下文用
+`<VER>` 代指，比如 `1.1.13`）。
 
 ### Step 0：拉最新 main
 
@@ -129,8 +137,6 @@ git fetch origin
 git checkout main
 git pull --ff-only origin main
 ```
-
-`git log --oneline -3` 应该能看到 `dd82936 docs:` 和 `3a56c80 fix(ui):`。
 
 ### Step 1：前置依赖自检 + 缺啥装啥（**Claude Code 自己装，别让用户装**）
 
@@ -179,7 +185,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 成功时产出：
 
 - `dist\ChainProxy\ChainProxy.exe` —— 解压版（可直接双击跑，含全部依赖）
-- `dist\ChainProxy-Setup-1.1.10.exe` —— Inno Setup 安装器（要发布的那个）
+- `dist\ChainProxy-Setup-<VER>.exe` —— Inno Setup 安装器（要发布的那个）
 
 ### Step 3：headless smoke test（不需要 GUI 也能跑）
 
@@ -200,23 +206,25 @@ Write-Host "OK: ChainProxy.exe started cleanly"
 如果 crash，看 `%APPDATA%\ChainProxy\app.log` 找原因。常见是 `mihomo.exe` 没被
 PyInstaller 打包进去——确认 `dist\ChainProxy\mihomo.exe` 存在。
 
-### Step 4：上传到现有的 v1.1.10 release（macOS DMG 已经挂在那里）
+### Step 4：发 release / 上传 asset
+
+如果是新版本，先建 release（macOS DMG 一般还没就绪，所以可能只有 Windows asset）：
 
 ```powershell
-gh release upload v1.1.10 dist\ChainProxy-Setup-1.1.10.exe --clobber
+gh release create v<VER> dist\ChainProxy-Setup-<VER>.exe --title "ChainProxy <VER>" --notes "<release notes>"
+```
+
+如果 release 已存在（比如 macOS DMG 已挂），就只上传：
+
+```powershell
+gh release upload v<VER> dist\ChainProxy-Setup-<VER>.exe --clobber
 ```
 
 `--clobber` 防止重传时报"asset 已存在"。
 
 ### Step 5：告诉用户验证 GUI（这步只能用户做）
 
-Claude Code 完成 1-4 后，告诉用户：
-
-> Windows 1.1.10 安装包已发布到 https://github.com/Laogeyouge/ChainProxy/releases/tag/v1.1.10。
-> 请装一下（卸载旧版后双击 `ChainProxy-Setup-1.1.10.exe`），开「分流规则」页验证 3 点：
-> 1. 内置规则集表格的「命中后」下拉框，下边圆角不被行分割线裁切
-> 2. 切到 `FirstHopOnly`，"y" 完整显示
-> 3. 鼠标悬停下拉框上滚滚轮，值不能变（必须点开下拉再选）
+Claude Code 完成 1-4 后，告诉用户安装包已发布的 URL，并附上当版需要回归验证的清单。
 
 ## 1.1.8 改动清单（核心）
 
